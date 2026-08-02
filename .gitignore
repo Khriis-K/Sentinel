@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+*.whl
+
+# Virtual environment
+.venv/
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+data/raw/
+outputs/
+*.pt
+*.pth
+
+# Excluded folders
+.claude/
+.codesight/
+docs/
+
+# Environment / secrets
+.env
+*.env
+!.env.example
+
+# Claude Code (local only)
+CLAUDE.md
+
+# Claude Code (local only)
+CLAUDE.md
+skills-lock.json
