@@ -1,0 +1,58 @@
+# Sentinel Configuration
+# All paths, hyperparameters, and API settings live here.
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  # BETH dataset files (place CSVs in data/raw/)
+  # Download from: https://www.kaggle.com/katehighnam/beth-dataset
+  # Expected files: beth_train.csv, beth_val.csv, beth_test.csv
+  # (or use the full dataset CSVs and we'll split by host)
+
+model:
+  # Sequence chunking
+  window_size: 512       # events per window
+  stride: 256            # 50% overlap
+
+  # Embeddings
+  process_name_embed_dim: 64
+  args_embed_dim: 64
+  user_id_embed_dim: 16
+  mount_namespace_embed_dim: 8
+  event_id_embed_dim: 16
+
+  # BiLSTM
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.3
+
+  # Training
+  batch_size: 64
+  learning_rate: 0.001
+  num_epochs: 50
+  weight_decay: 1e-5
+  early_stopping_patience: 10
+
+baselines:
+  # scikit-learn baselines from the BETH paper
+  # iForest, Robust Covariance, One-Class SVM
+  contamination: 0.01  # expected fraction of anomalies
+
+deepseek:
+  api_key: "${DEEPSEEK_API_KEY}"  # resolved from env var
+  model: "deepseek-chat"
+  max_tokens: 1024
+  temperature: 0.3
+
+dashboard:
+  title: "Sentinel — SOC Monitor"
+  theme: "dark"
+  threshold_default: 0.5
+
+outputs:
+  dir: "outputs"
+  model_pt: "model.pt"
+  eval_results: "eval_results.json"
+  flagged_events: "flagged_events.json"
+  incident_reports: "incident_reports.jsonl"
+  validation_results: "validation_results.json"

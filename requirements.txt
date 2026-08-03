@@ -1,0 +1,23 @@
+# Sentinel — SOC Alert Triage & Incident Report Generator
+# Core ML
+torch>=2.0.0
+scikit-learn>=1.3.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Configuration & utilities
+PyYAML>=6.0
+tqdm>=4.65.0
+
+# LLM API
+httpx>=0.24.0
+
+# Dashboard
+streamlit>=1.30.0
+plotly>=5.15.0
+
+# Testing
+pytest>=7.4.0
+
+# Optional: text tokenization (use what's available; fall back to whitespace)
+# transformers>=4.30.0  # uncomment if you want a real tokenizer

@@ -41,9 +41,7 @@ docs/
 *.env
 !.env.example
 
-# Claude Code (local only)
+# AI editor instruction files (local only)
 CLAUDE.md
-
-# Claude Code (local only)
-CLAUDE.md
+AGENTS.md
 skills-lock.json
