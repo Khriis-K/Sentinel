@@ -253,7 +253,9 @@ def extract_paper_features(df: pd.DataFrame) -> np.ndarray:
 
     features[:, 2] = (df["userId"].fillna(0) == 0).astype(np.float32).values
 
-    features[:, 3] = (df["mountNamespace"].fillna(0) == 0).astype(np.float32).values
+    if "mountNamespace" in df.columns:
+        features[:, 3] = (df["mountNamespace"].fillna(0) == 0).astype(np.float32).values
+    # else: column missing from per-host CSVs, leave as zeros
 
     eid_counts = df["eventId"].value_counts()
     features[:, 4] = (df["eventId"].map(eid_counts) == 1).astype(np.float32).values
