@@ -5,10 +5,9 @@ evaluation protocol (ADR-0004): raw scores, thresholds tuned on the
 attack-val carve-out exactly like the neural model, precision@k added.
 Test is never used for tuning.
 """
-from typing import Dict, Optional
+from typing import Dict
 
 import numpy as np
-import pandas as pd
 
 from src.baselines import (
     extract_paper_features,
@@ -17,7 +16,7 @@ from src.baselines import (
     train_one_class_svm,
     train_robust_covariance,
 )
-from src.data import carve_attack_val, load_beth_data, split_by_host
+from src.data import load_host_splits
 from src.eval import evaluate_scores, tune_threshold
 
 BASELINE_CAVEAT = (
@@ -27,36 +26,6 @@ BASELINE_CAVEAT = (
     "Thresholds are tuned on attack-val, not via the paper's contamination "
     "constant."
 )
-
-
-def _load_and_carve(
-    data_dir: str,
-    n_blocks: int,
-    tune_frac: float,
-    seed: int,
-):
-    """Re-derive the host split + attack-val carve-out.
-
-    Deterministic and identical to the neural pipeline given the same
-    seed, so every model is thresholded on the same tuning events.
-    """
-    host_dfs = load_beth_data(data_dir)
-    if not host_dfs:
-        raise FileNotFoundError(f"No CSV files found in {data_dir}")
-
-    sorted_parts = []
-    for host in sorted(host_dfs):
-        df = host_dfs[host]
-        if "timestamp" in df.columns:
-            df = df.sort_values("timestamp")
-        sorted_parts.append(df)
-    full_df = pd.concat(sorted_parts, ignore_index=True)
-
-    train_df, _, test_df = split_by_host(full_df, seed=seed)
-    tune_df, test_df = carve_attack_val(
-        test_df, n_blocks=n_blocks, tune_frac=tune_frac, seed=seed,
-    )
-    return train_df, tune_df, test_df
 
 
 def run_baseline_comparison(
@@ -88,7 +57,11 @@ def run_baseline_comparison(
     Returns:
         Dict of baseline name → metrics dict (plus 'caveat').
     """
-    train_df, tune_df, test_df = _load_and_carve(data_dir, n_blocks, tune_frac, seed)
+    # Same seed as the neural pipeline → identical split + carve, so every
+    # model is thresholded on the same tuning events.
+    train_df, _, tune_df, test_df = load_host_splits(
+        data_dir, n_blocks=n_blocks, tune_frac=tune_frac, seed=seed,
+    )
 
     rng = np.random.default_rng(seed)
     n_train = min(train_sample_size, len(train_df))

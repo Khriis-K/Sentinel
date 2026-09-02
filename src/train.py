@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.data import TARGET_FIELDS, load_next_event_pipeline
-from src.eval import evaluate_scores, tune_threshold
+from src.eval import evaluate_scores, json_serialize, tune_threshold
 from src.model import NextEventLSTM
 
 
@@ -404,21 +404,10 @@ def main(
     # ── Save eval results ────────────────────────────────────────────────────
     eval_path = output_path / "eval_results.json"
     with open(eval_path, "w") as f:
-        json.dump(eval_results, f, indent=2, default=_json_serialize)
+        json.dump(eval_results, f, indent=2, default=json_serialize)
     print(f"Saved eval results -> {eval_path}")
 
     return eval_results
-
-
-def _json_serialize(obj):
-    """Handle numpy types for JSON serialization."""
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 if __name__ == "__main__":

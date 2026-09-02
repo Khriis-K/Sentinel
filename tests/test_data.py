@@ -827,15 +827,28 @@ def test_load_next_event_pipeline_split_discipline(pipeline_csv_dir):
 
 
 def test_load_next_event_pipeline_tune_covers_both_evil_hosts(pipeline_csv_dir):
-    """Tuning set must contain evil events from both evil test hosts."""
+    """The carved tuning frame must contain evil events from both evil hosts.
+
+    Frame-level guarantee (the carve-out's contract). Scored evil also
+    depends on trailing-context availability inside each carve segment,
+    which tiny fixtures cannot promise.
+    """
     _, _, tune_ds, _, _, _ = load_next_event_pipeline(
         pipeline_csv_dir, window_size=128, seed=7,
     )
-    # Per-host evil coverage: labels come from the carved tune frame in
-    # host order; check the tune dataset's evil count exceeds one host's
-    # burst (30 events each) or, more robustly, that evil exists at all.
-    n_evil = int(tune_ds.labels.sum())
-    assert n_evil > 0, "Tuning set has no evil events"
+
+    # Labels span the full carved frame; hosts are contiguous segments in
+    # host_lengths order.
+    evil_per_host = []
+    offset = 0
+    for host_n in tune_ds.host_lengths:
+        evil_per_host.append(int(tune_ds.labels[offset:offset + host_n].sum()))
+        offset += host_n
+
+    n_hosts_with_evil = sum(1 for count in evil_per_host if count > 0)
+    assert n_hosts_with_evil >= 2, (
+        f"Expected evil from both evil hosts, per-host counts: {evil_per_host}"
+    )
 
 
 def test_load_next_event_pipeline_vocab_sizes(pipeline_csv_dir):

@@ -263,7 +263,7 @@ def test_surprisal_varies_with_input(model, vocab_sizes):
         return {
             "processName": torch.full((batch_size, seq_len), 5, dtype=torch.int64),
             "args_ids": torch.full((batch_size, seq_len, 64), 3, dtype=torch.int64),
-            "userId": torch.full((batch_size, seq_len), user_value, dtype=torch.int64),
+            "userId": torch.full((batch_size, seq_len), user_id_value, dtype=torch.int64),
             "eventId": torch.full((batch_size, seq_len), event_value, dtype=torch.int64),
             "argsNum": torch.full((batch_size, seq_len), 2, dtype=torch.int64),
             "returnValue": torch.full((batch_size, seq_len), 1, dtype=torch.int64),
@@ -281,11 +281,10 @@ def test_surprisal_varies_with_input(model, vocab_sizes):
 
     targets = make_targets()
 
-    user_value, event_value = 1, 1
     model.eval()
     with torch.no_grad():
-        s1 = model.surprisal(make_context(user_value, event_value), targets)["total"]
-        s2 = model.surprisal(make_context(user_value + 1, event_value + 2), targets)["total"]
+        s1 = model.surprisal(make_context(1, 1), targets)["total"]
+        s2 = model.surprisal(make_context(2, 3), targets)["total"]
 
     assert not torch.allclose(s1, s2), (
         "Surprisal identical across different contexts — model ignores its input"

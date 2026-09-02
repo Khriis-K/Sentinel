@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.data import TARGET_FIELDS
+
 
 class NextEventLSTM(nn.Module):
     """Next-event predictor over kernel process event sequences.
@@ -33,7 +35,7 @@ class NextEventLSTM(nn.Module):
       - Event vector ≈ 180 dims → forward LSTM → per-field Linear heads
     """
 
-    target_fields: Tuple[str, ...] = ("eventId", "processName", "userId", "returnValue", "argsNum")
+    target_fields: Tuple[str, ...] = TARGET_FIELDS
 
     def __init__(
         self,
@@ -107,6 +109,9 @@ class NextEventLSTM(nn.Module):
         self.heads = nn.ModuleDict({
             field: nn.Linear(hidden_size, size) for field, size in head_sizes.items()
         })
+        assert set(head_sizes) == set(TARGET_FIELDS), (
+            "Prediction heads must match TARGET_FIELDS from the data pipeline"
+        )
 
         # ── Config ───────────────────────────────────────────────────────────
         self.hidden_size = hidden_size

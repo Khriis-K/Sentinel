@@ -604,6 +604,41 @@ def _sort_within_hosts(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[int]]:
 
 # ── End-to-End Pipeline ────────────────────────────────────────────────────────
 
+def load_host_splits(
+    raw_dir: str,
+    n_blocks: int = 50,
+    tune_frac: float = 0.2,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load per-host CSVs, split by host, and carve attack-val from test.
+
+    Deterministic: the same seed yields identical frames, so the neural
+    pipeline and the baseline protocol (src.baseline_protocol) consume
+    exactly the same events.
+
+    Returns:
+        (train_df, val_df, tune_df, test_df)
+    """
+    host_dfs = load_beth_data(raw_dir)
+    if not host_dfs:
+        raise FileNotFoundError(f"No CSV files found in {raw_dir}")
+
+    # Sort within each host, then concatenate hosts deterministically
+    sorted_parts = []
+    for host in sorted(host_dfs):
+        df = host_dfs[host]
+        if "timestamp" in df.columns:
+            df = df.sort_values("timestamp")
+        sorted_parts.append(df)
+    full_df = pd.concat(sorted_parts, ignore_index=True)
+
+    train_df, val_df, test_df = split_by_host(full_df, seed=seed)
+    tune_df, test_df = carve_attack_val(
+        test_df, n_blocks=n_blocks, tune_frac=tune_frac, seed=seed,
+    )
+    return train_df, val_df, tune_df, test_df
+
+
 def load_next_event_pipeline(
     raw_dir: str = "data/raw/per_host",
     window_size: int = 512,
@@ -651,24 +686,9 @@ def load_next_event_pipeline(
         positions) for evaluation; ``vocabs`` maps
         {'process_name', 'args', 'cat'} → vocabulary dicts.
     """
-    # ── Load ────────────────────────────────────────────────────────────────
-    host_dfs = load_beth_data(raw_dir)
-    if not host_dfs:
-        raise FileNotFoundError(f"No CSV files found in {raw_dir}")
-
-    # Sort within each host, then concatenate hosts deterministically
-    sorted_parts = []
-    for host in sorted(host_dfs):
-        df = host_dfs[host]
-        if "timestamp" in df.columns:
-            df = df.sort_values("timestamp")
-        sorted_parts.append(df)
-    full_df = pd.concat(sorted_parts, ignore_index=True)
-
-    # ── Split by host, then carve attack-val out of test ─────────────────────
-    train_df, val_df, test_df = split_by_host(full_df, seed=seed)
-    tune_df, test_df = carve_attack_val(
-        test_df, n_blocks=n_blocks, tune_frac=tune_frac, seed=seed,
+    # ── Load, split by host, carve attack-val ────────────────────────────────
+    train_df, val_df, tune_df, test_df = load_host_splits(
+        raw_dir, n_blocks=n_blocks, tune_frac=tune_frac, seed=seed,
     )
 
     # ── Sort within hosts (keep hosts contiguous) ────────────────────────────

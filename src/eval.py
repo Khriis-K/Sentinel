@@ -97,6 +97,17 @@ def tune_threshold(
     }
 
 
+def json_serialize(obj):
+    """Handle numpy types for JSON serialization of eval results."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
 def evaluate_scores(
     y_true: np.ndarray,
     scores: np.ndarray,
