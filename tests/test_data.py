@@ -15,6 +15,8 @@ from src.data import (
     build_vocab,
     build_categorical_vocab,
     map_categorical,
+    bucket_return_value,
+    bucket_args_num,
     tokenize_texts,
     preprocess_features,
     BethDataset,
@@ -212,6 +214,89 @@ def test_categorical_vocab_indices_are_contiguous():
     vocab = build_categorical_vocab(series)
     indices = sorted(vocab.values())
     assert indices == list(range(1, len(vocab) + 1))
+
+
+# ── Numeric Bucketizers ────────────────────────────────────────────────────────
+
+def test_bucket_return_value_error_is_class_zero():
+    """returnValue −1 (error) must map to class 0."""
+    out = bucket_return_value(pd.Series([-1, -1, -5]))
+    np.testing.assert_array_equal(out, [0, 0, 0])
+
+
+def test_bucket_return_value_zero_is_class_one():
+    """returnValue 0 (success) must map to class 1."""
+    out = bucket_return_value(pd.Series([0, 0, 0]))
+    np.testing.assert_array_equal(out, [1, 1, 1])
+
+
+def test_bucket_return_value_one():
+    """returnValue 1 must land in the first positive bin."""
+    out = bucket_return_value(pd.Series([1]))
+    assert out[0] >= 2
+    assert out[0] <= 12
+
+
+def test_bucket_return_value_extreme_tail_capped():
+    """Huge positive values must saturate at the top class (12)."""
+    out = bucket_return_value(pd.Series([10**9, 2**31 - 1]))
+    np.testing.assert_array_equal(out, [12, 12])
+
+
+def test_bucket_return_value_monotonic_in_value():
+    """Larger positive return values must never map to a lower class."""
+    values = pd.Series([1, 2, 7, 100, 10_000, 10**9])
+    out = bucket_return_value(values)
+    assert (np.diff(out) >= 0).all(), f"Non-monotonic buckets: {out}"
+
+
+def test_bucket_return_value_classes_within_13():
+    """All outputs must be within [0, 12]."""
+    rng = np.random.default_rng(0)
+    values = pd.Series(rng.integers(-5, 2**31 - 1, 5000))
+    out = bucket_return_value(values)
+    assert out.min() >= 0 and out.max() <= 12
+
+
+def test_bucket_return_value_deterministic():
+    """Same input must produce identical buckets."""
+    values = pd.Series([-1, 0, 1, 5, 999999])
+    out1 = bucket_return_value(values)
+    out2 = bucket_return_value(values)
+    np.testing.assert_array_equal(out1, out2)
+
+
+def test_bucket_return_value_handles_nan():
+    """NaN must map to the zero/success class (fillna(0) convention)."""
+    out = bucket_return_value(pd.Series([np.nan, 0]))
+    np.testing.assert_array_equal(out, [1, 1])
+
+
+def test_bucket_args_num_basic():
+    """argsNum maps to its own class for 0..15."""
+    values = pd.Series(range(16))
+    out = bucket_args_num(values)
+    np.testing.assert_array_equal(out, np.arange(16))
+
+
+def test_bucket_args_num_capped_at_fifteen():
+    """Counts of 15 and above must collapse into the top class (15)."""
+    out = bucket_args_num(pd.Series([14, 15, 16, 100, 10**9]))
+    np.testing.assert_array_equal(out, [14, 15, 15, 15, 15])
+
+
+def test_bucket_args_num_negative_clamped():
+    """Negative counts (shouldn't occur, but) must clamp to class 0."""
+    out = bucket_args_num(pd.Series([-3, -1, 0]))
+    np.testing.assert_array_equal(out, [0, 0, 0])
+
+
+def test_bucket_args_num_deterministic():
+    """Same input must produce identical buckets."""
+    values = pd.Series([0, 3, 15, 42])
+    out1 = bucket_args_num(values)
+    out2 = bucket_args_num(values)
+    np.testing.assert_array_equal(out1, out2)
 
 
 # ── Tokenization ───────────────────────────────────────────────────────────────

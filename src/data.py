@@ -175,6 +175,53 @@ def map_categorical(series: pd.Series, vocab: Dict[int, int]) -> np.ndarray:
     )
 
 
+# ── Numeric Bucketizers ────────────────────────────────────────────────────────
+#
+# Deterministic, not fitted from data: train/test schemas match by construction.
+
+RETURN_VALUE_CLASSES = 13
+ARGS_NUM_CLASSES = 16
+
+
+def bucket_return_value(series: pd.Series) -> np.ndarray:
+    """Bucket returnValue into 13 deterministic classes.
+
+    Class 0: error (any negative value, −1 in practice).
+    Class 1: zero (success).
+    Classes 2..12: positive magnitudes, 2 + min(ceil(log1p(v)), 10).
+    Class 2 is unreachable for integer inputs (ceil(log1p(v)) >= 1 for
+    v >= 1); it is reserved so the schema spans exactly 13 indices.
+
+    Args:
+        series: Raw returnValue values.
+
+    Returns:
+        int64 array of bucket classes in [0, 12].
+    """
+    v = series.fillna(0).astype(np.int64).values
+    out = np.ones(len(v), dtype=np.int64)  # default: zero class
+    out[v < 0] = 0
+    pos = v > 0
+    if pos.any():
+        out[pos] = 2 + np.minimum(
+            np.ceil(np.log1p(v[pos])).astype(np.int64), 10
+        )
+    return out
+
+
+def bucket_args_num(series: pd.Series) -> np.ndarray:
+    """Bucket argsNum into 16 deterministic classes (count capped at 15+).
+
+    Args:
+        series: Raw argsNum values.
+
+    Returns:
+        int64 array of bucket classes in [0, 15].
+    """
+    v = series.fillna(0).astype(np.int64).values
+    return np.clip(v, 0, ARGS_NUM_CLASSES - 1).astype(np.int64)
+
+
 # ── Vocabulary Building ────────────────────────────────────────────────────────
 
 def build_vocab(
