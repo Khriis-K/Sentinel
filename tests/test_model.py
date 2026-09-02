@@ -1,165 +1,331 @@
 """
-Tests for src.model — SentinelVAE architecture, embedding dimensions,
-forward-pass output shapes, and reconstruction error. Also tests for
-CenteredWindowDataset.
+Tests for src.model — NextEventLSTM architecture, embedding dimensions,
+forward-pass output shapes, per-field logits, and surprisal scoring.
 """
 import numpy as np
 import pytest
 import torch
 
-from src.model import SentinelVAE
-from src.data import CenteredWindowDataset
+from src.model import NextEventLSTM
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture
 def vocab_sizes():
-    """Realistic vocab sizes matching the BETH benchmark subset."""
+    """Vocab sizes matching the BETH benchmark (each includes the OOV slot)."""
     return {
         "process_name_vocab_size": 105,
         "args_vocab_size": 10000,
         "user_id_vocab_size": 8,
-        "mount_ns_vocab_size": 7,
         "event_id_vocab_size": 45,
+        "args_num_vocab_size": 16,
+        "return_value_vocab_size": 13,
+        "parent_pid_vocab_size": 3,
     }
 
 
 @pytest.fixture
 def model(vocab_sizes):
-    """Create a VAE with default hyperparameters."""
-    return SentinelVAE(**vocab_sizes)
+    """Create a next-event model with default hyperparameters."""
+    return NextEventLSTM(**vocab_sizes)
 
 
 @pytest.fixture
-def sample_batch(vocab_sizes):
-    """Build a synthetic batch matching BethDataset output shapes."""
+def sample_context(vocab_sizes):
+    """Synthetic context batch matching TrailingWindowDataset output shapes."""
     batch_size = 4
     seq_len = 128  # shorter window for tests
 
     return {
-        "processName_ids": torch.randint(0, vocab_sizes["process_name_vocab_size"], (batch_size, seq_len, 16)),
+        "processName": torch.randint(0, vocab_sizes["process_name_vocab_size"], (batch_size, seq_len)),
         "args_ids": torch.randint(0, vocab_sizes["args_vocab_size"], (batch_size, seq_len, 64)),
         "userId": torch.randint(0, vocab_sizes["user_id_vocab_size"], (batch_size, seq_len)),
-        "mountNamespace": torch.randint(0, vocab_sizes["mount_ns_vocab_size"], (batch_size, seq_len)),
         "eventId": torch.randint(0, vocab_sizes["event_id_vocab_size"], (batch_size, seq_len)),
-        "argsNum": torch.randn(batch_size, seq_len),
-        "returnValue": torch.randn(batch_size, seq_len),
-        "parentProcessId": torch.randn(batch_size, seq_len),
+        "argsNum": torch.randint(0, vocab_sizes["args_num_vocab_size"], (batch_size, seq_len)),
+        "returnValue": torch.randint(0, vocab_sizes["return_value_vocab_size"], (batch_size, seq_len)),
+        "parentProcessId": torch.randint(0, vocab_sizes["parent_pid_vocab_size"], (batch_size, seq_len)),
+    }
+
+
+@pytest.fixture
+def sample_targets(vocab_sizes):
+    """Synthetic targets for the five predicted fields."""
+    batch_size = 4
+    return {
+        "eventId": torch.randint(0, vocab_sizes["event_id_vocab_size"], (batch_size,)),
+        "processName": torch.randint(0, vocab_sizes["process_name_vocab_size"], (batch_size,)),
+        "userId": torch.randint(0, vocab_sizes["user_id_vocab_size"], (batch_size,)),
+        "returnValue": torch.randint(0, vocab_sizes["return_value_vocab_size"], (batch_size,)),
+        "argsNum": torch.randint(0, vocab_sizes["args_num_vocab_size"], (batch_size,)),
     }
 
 
 # ── Embedding Dimensions ──────────────────────────────────────────────────────
 
-def test_embedding_dims_match_spec(model):
-    """Embedding dimensions must match the PRD specification."""
+def test_embedding_dims_match_defaults(model):
+    """Default embedding dims carried over from the VAE-era stack."""
     dims = model.embedding_dims
     assert dims["processName"] == 64, f"Expected 64, got {dims['processName']}"
     assert dims["args"] == 64, f"Expected 64, got {dims['args']}"
     assert dims["userId"] == 16, f"Expected 16, got {dims['userId']}"
-    assert dims["mountNamespace"] == 8, f"Expected 8, got {dims['mountNamespace']}"
     assert dims["eventId"] == 16, f"Expected 16, got {dims['eventId']}"
+    assert dims["argsNum"] == 8, f"Expected 8, got {dims['argsNum']}"
+    assert dims["returnValue"] == 8, f"Expected 8, got {dims['returnValue']}"
+    assert dims["parentProcessId"] == 4, f"Expected 4, got {dims['parentProcessId']}"
 
 
-def test_embedding_vocab_sizes(model, vocab_sizes):
-    """Embedding layers should have the correct vocabulary sizes."""
+def test_embedding_vocab_sizes_wired_through(model, vocab_sizes):
+    """Embedding tables must reflect the vocab sizes passed at construction."""
     assert model.process_name_embed.num_embeddings == vocab_sizes["process_name_vocab_size"]
     assert model.args_embed.num_embeddings == vocab_sizes["args_vocab_size"]
     assert model.user_id_embed.num_embeddings == vocab_sizes["user_id_vocab_size"]
-    assert model.mount_ns_embed.num_embeddings == vocab_sizes["mount_ns_vocab_size"]
     assert model.event_id_embed.num_embeddings == vocab_sizes["event_id_vocab_size"]
+    assert model.args_num_embed.num_embeddings == vocab_sizes["args_num_vocab_size"]
+    assert model.return_value_embed.num_embeddings == vocab_sizes["return_value_vocab_size"]
+    assert model.parent_pid_embed.num_embeddings == vocab_sizes["parent_pid_vocab_size"]
+
+
+def test_head_vocab_sizes_wired_through(model, vocab_sizes):
+    """Each per-field head must output exactly vocab_size logits."""
+    expected = {
+        "processName": vocab_sizes["process_name_vocab_size"],
+        "userId": vocab_sizes["user_id_vocab_size"],
+        "eventId": vocab_sizes["event_id_vocab_size"],
+        "returnValue": vocab_sizes["return_value_vocab_size"],
+        "argsNum": vocab_sizes["args_num_vocab_size"],
+    }
+    for field, size in expected.items():
+        assert model.heads[field].out_features == size, (
+            f"Head {field} outputs {model.heads[field].out_features}, expected {size}"
+        )
 
 
 def test_custom_embedding_dims():
     """Custom embedding dimensions should be reflected in the model."""
-    model = SentinelVAE(
+    model = NextEventLSTM(
         process_name_vocab_size=50,
         args_vocab_size=200,
         user_id_vocab_size=10,
-        mount_ns_vocab_size=5,
         event_id_vocab_size=20,
+        args_num_vocab_size=16,
+        return_value_vocab_size=13,
+        parent_pid_vocab_size=3,
         process_name_embed_dim=32,
         args_embed_dim=32,
         user_id_embed_dim=8,
-        mount_ns_embed_dim=4,
         event_id_embed_dim=8,
+        args_num_embed_dim=4,
+        return_value_embed_dim=4,
+        parent_pid_embed_dim=2,
     )
     dims = model.embedding_dims
     assert dims["processName"] == 32
     assert dims["args"] == 32
     assert dims["userId"] == 8
-    assert dims["mountNamespace"] == 4
     assert dims["eventId"] == 8
+    assert dims["argsNum"] == 4
+    assert dims["returnValue"] == 4
+    assert dims["parentProcessId"] == 2
 
-    # Event dim should be 32+32+8+4+8+3 = 87
-    assert model.event_dim == 87
+    # Event dim should be 32+32+8+8+4+4+2 = 90
+    assert model.event_dim == 90
 
-
-# ── Forward Pass ──────────────────────────────────────────────────────────────
-
-def test_forward_output_shapes(model, sample_batch):
-    """Forward pass should produce (reconstructed, mu, logvar) with correct shapes."""
-    model.eval()
-    with torch.no_grad():
-        reconstructed, mu, logvar = model(sample_batch)
-    batch_size = sample_batch["userId"].shape[0]
-    seq_len = sample_batch["userId"].shape[1]
-    event_dim = model.event_dim
-
-    assert reconstructed.shape == (batch_size, seq_len, event_dim), \
-        f"Expected ({batch_size}, {seq_len}, {event_dim}), got {reconstructed.shape}"
-    assert mu.shape == (batch_size, model.latent_dim), \
-        f"Expected ({batch_size}, {model.latent_dim}), got {mu.shape}"
-    assert logvar.shape == (batch_size, model.latent_dim), \
-        f"Expected ({batch_size}, {model.latent_dim}), got {logvar.shape}"
-
-
-def test_forward_output_is_finite(model, sample_batch):
-    """All outputs should be finite (no NaN or inf)."""
-    model.eval()
-    with torch.no_grad():
-        reconstructed, mu, logvar = model(sample_batch)
-    assert torch.isfinite(reconstructed).all(), "Non-finite values in reconstructed"
-    assert torch.isfinite(mu).all(), "Non-finite values in mu"
-    assert torch.isfinite(logvar).all(), "Non-finite values in logvar"
-
-
-def test_model_train_mode_works(model, sample_batch):
-    """Model should produce output in training mode (dropout active)."""
-    model.train()
-    reconstructed, mu, logvar = model(sample_batch)
-    batch_size = sample_batch["userId"].shape[0]
-    seq_len = sample_batch["userId"].shape[1]
-    assert reconstructed.shape == (batch_size, seq_len, model.event_dim)
-
-
-def test_model_deterministic_in_eval(model, sample_batch):
-    """In eval mode (no sampling noise), same input should produce identical output."""
-    model.eval()
-    with torch.no_grad():
-        recon1, mu1, logvar1 = model(sample_batch)
-        recon2, mu2, logvar2 = model(sample_batch)
-    # mu and logvar should be identical (encoder is deterministic)
-    torch.testing.assert_close(mu1, mu2)
-    torch.testing.assert_close(logvar1, logvar2)
-    # reconstructed should also be identical (decoder input is deterministic in eval)
-    # Note: in training mode, reparameterize() samples ε, so outputs would differ
-
-
-# ── Architecture Properties ───────────────────────────────────────────────────
 
 def test_event_dim_calculation(model):
-    """Event vector dimension should match sum of embedding dims + 3 numeric."""
+    """Event vector dimension should equal the sum of all embedding dims."""
     dims = model.embedding_dims
-    expected = sum(dims.values()) + 3
+    expected = sum(dims.values())
     assert model.event_dim == expected, \
         f"Expected event_dim={expected}, got {model.event_dim}"
 
 
-def test_latent_dim(model):
-    """Default latent dimension should be 32."""
-    assert model.latent_dim == 32
+def test_oov_embeddings_are_learnable(model):
+    """Index 0 is OOV (a novelty signal), not padding — its embedding must train.
 
+    Only the args token embedding may freeze index 0 (genuine PAD).
+    """
+    for name in ["process_name_embed", "user_id_embed", "event_id_embed"]:
+        embed = getattr(model, name)
+        assert embed.padding_idx is None, (
+            f"{name} must not freeze index 0 (OOV is a real class)"
+        )
+    assert model.args_embed.padding_idx == 0, "args PAD index must stay frozen"
+
+
+# ── Forward Pass ──────────────────────────────────────────────────────────────
+
+def test_forward_output_shapes(model, sample_context, vocab_sizes):
+    """Forward pass must produce per-field logits of shape (B, vocab_k)."""
+    model.eval()
+    with torch.no_grad():
+        logits = model(sample_context)
+
+    expected_fields = {"eventId", "processName", "userId", "returnValue", "argsNum"}
+    assert set(logits.keys()) == expected_fields
+
+    batch_size = sample_context["userId"].shape[0]
+    expected_sizes = {
+        "eventId": vocab_sizes["event_id_vocab_size"],
+        "processName": vocab_sizes["process_name_vocab_size"],
+        "userId": vocab_sizes["user_id_vocab_size"],
+        "returnValue": vocab_sizes["return_value_vocab_size"],
+        "argsNum": vocab_sizes["args_num_vocab_size"],
+    }
+    for field, size in expected_sizes.items():
+        assert logits[field].shape == (batch_size, size), (
+            f"logits[{field}] shape {logits[field].shape}, expected ({batch_size}, {size})"
+        )
+
+
+def test_forward_output_is_finite(model, sample_context):
+    """All logits must be finite (no NaN or inf)."""
+    model.eval()
+    with torch.no_grad():
+        logits = model(sample_context)
+    for field, values in logits.items():
+        assert torch.isfinite(values).all(), f"Non-finite logits for {field}"
+
+
+def test_model_train_mode_works(model, sample_context):
+    """Model should produce output in training mode (dropout active)."""
+    model.train()
+    logits = model(sample_context)
+    batch_size = sample_context["userId"].shape[0]
+    for field, values in logits.items():
+        assert values.shape[0] == batch_size
+
+
+def test_variable_batch_size(model, vocab_sizes):
+    """Model should handle different batch sizes."""
+    for bs in [1, 2, 8]:
+        context = {
+            "processName": torch.randint(0, vocab_sizes["process_name_vocab_size"], (bs, 128)),
+            "args_ids": torch.randint(0, vocab_sizes["args_vocab_size"], (bs, 128, 64)),
+            "userId": torch.randint(0, vocab_sizes["user_id_vocab_size"], (bs, 128)),
+            "eventId": torch.randint(0, vocab_sizes["event_id_vocab_size"], (bs, 128)),
+            "argsNum": torch.randint(0, vocab_sizes["args_num_vocab_size"], (bs, 128)),
+            "returnValue": torch.randint(0, vocab_sizes["return_value_vocab_size"], (bs, 128)),
+            "parentProcessId": torch.randint(0, vocab_sizes["parent_pid_vocab_size"], (bs, 128)),
+        }
+        model.eval()
+        with torch.no_grad():
+            logits = model(context)
+        for field, values in logits.items():
+            assert values.shape == (bs, model.heads[field].out_features), (
+                f"Batch size {bs}, field {field}: unexpected shape {values.shape}"
+            )
+
+
+# ── Surprisal ─────────────────────────────────────────────────────────────────
+
+def test_surprisal_shapes(model, sample_context, sample_targets):
+    """surprisal must return per-field (B,) tensors plus a 'total' (B,) tensor."""
+    model.eval()
+    with torch.no_grad():
+        surprisal = model.surprisal(sample_context, sample_targets)
+
+    for field in ["eventId", "processName", "userId", "returnValue", "argsNum", "total"]:
+        assert field in surprisal, f"Missing surprisal key {field}"
+        assert surprisal[field].shape == (sample_targets["eventId"].shape[0],)
+
+
+def test_surprisal_positive_and_finite(model, sample_context, sample_targets):
+    """Surprisals are -log probabilities: finite and non-negative."""
+    model.eval()
+    with torch.no_grad():
+        surprisal = model.surprisal(sample_context, sample_targets)
+    for field, values in surprisal.items():
+        assert torch.isfinite(values).all(), f"Non-finite surprisal for {field}"
+        assert (values >= 0).all(), f"Negative surprisal for {field}"
+
+
+def test_total_surprisal_is_sum_of_fields(model, sample_context, sample_targets):
+    """Total surprisal must equal the sum of the per-field surprisals."""
+    model.eval()
+    with torch.no_grad():
+        surprisal = model.surprisal(sample_context, sample_targets)
+
+    field_sum = sum(surprisal[f] for f in ["eventId", "processName", "userId", "returnValue", "argsNum"])
+    torch.testing.assert_close(surprisal["total"], field_sum)
+
+
+def test_surprisal_varies_with_input(model, vocab_sizes):
+    """REGRESSION TRIPWIRE: surprisal must respond when the input changes.
+
+    The next-event analog of the VAE collapse diagnostics — if surprisal
+    stops depending on the context, the model has degenerated.
+    """
+    torch.manual_seed(0)
+    batch_size, seq_len = 4, 128
+
+    def make_context(user_id_value, event_value):
+        return {
+            "processName": torch.full((batch_size, seq_len), 5, dtype=torch.int64),
+            "args_ids": torch.full((batch_size, seq_len, 64), 3, dtype=torch.int64),
+            "userId": torch.full((batch_size, seq_len), user_value, dtype=torch.int64),
+            "eventId": torch.full((batch_size, seq_len), event_value, dtype=torch.int64),
+            "argsNum": torch.full((batch_size, seq_len), 2, dtype=torch.int64),
+            "returnValue": torch.full((batch_size, seq_len), 1, dtype=torch.int64),
+            "parentProcessId": torch.full((batch_size, seq_len), 1, dtype=torch.int64),
+        }
+
+    def make_targets():
+        return {
+            "eventId": torch.randint(0, vocab_sizes["event_id_vocab_size"], (batch_size,)),
+            "processName": torch.randint(0, vocab_sizes["process_name_vocab_size"], (batch_size,)),
+            "userId": torch.randint(0, vocab_sizes["user_id_vocab_size"], (batch_size,)),
+            "returnValue": torch.randint(0, vocab_sizes["return_value_vocab_size"], (batch_size,)),
+            "argsNum": torch.randint(0, vocab_sizes["args_num_vocab_size"], (batch_size,)),
+        }
+
+    targets = make_targets()
+
+    user_value, event_value = 1, 1
+    model.eval()
+    with torch.no_grad():
+        s1 = model.surprisal(make_context(user_value, event_value), targets)["total"]
+        s2 = model.surprisal(make_context(user_value + 1, event_value + 2), targets)["total"]
+
+    assert not torch.allclose(s1, s2), (
+        "Surprisal identical across different contexts — model ignores its input"
+    )
+
+
+def test_surprisal_varies_with_target(model, sample_context, vocab_sizes):
+    """Different targets under the same context should score differently."""
+    model.eval()
+    t1 = {f: torch.zeros(4, dtype=torch.int64) for f in ["eventId", "processName", "userId", "returnValue", "argsNum"]}
+    t2 = {f: torch.ones(4, dtype=torch.int64) for f in t1}
+    with torch.no_grad():
+        s1 = model.surprisal(sample_context, t1)["total"]
+        s2 = model.surprisal(sample_context, t2)["total"]
+    assert not torch.allclose(s1, s2)
+
+
+# ── Serialization ─────────────────────────────────────────────────────────────
+
+def test_init_kwargs_saved(model, vocab_sizes):
+    """Model must record its init kwargs for checkpoint round-trips."""
+    kwargs = model._init_kwargs
+    for key, value in vocab_sizes.items():
+        assert kwargs[key] == value, f"{key} not round-tripped"
+    assert kwargs["hidden_size"] == 128
+    assert kwargs["num_layers"] == 2
+    assert kwargs["dropout"] == 0.3
+
+
+def test_init_kwargs_round_trip(vocab_sizes):
+    """Reconstructing from _init_kwargs must yield an equivalent model."""
+    model = NextEventLSTM(**vocab_sizes, hidden_size=64, num_layers=1)
+    clone = NextEventLSTM(**model._init_kwargs)
+    assert clone._init_kwargs == model._init_kwargs
+    assert clone.event_dim == model.event_dim
+    assert clone.hidden_size == 64
+    assert clone.num_layers == 1
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
 
 def test_hidden_size(model):
     """Default hidden size should be 128."""
@@ -171,323 +337,6 @@ def test_num_layers(model):
     assert model.num_layers == 2
 
 
-def test_variable_batch_size(model, vocab_sizes):
-    """Model should handle different batch sizes."""
-    for bs in [1, 2, 8]:
-        batch = {
-            "processName_ids": torch.randint(0, vocab_sizes["process_name_vocab_size"], (bs, 128, 16)),
-            "args_ids": torch.randint(0, vocab_sizes["args_vocab_size"], (bs, 128, 64)),
-            "userId": torch.randint(0, vocab_sizes["user_id_vocab_size"], (bs, 128)),
-            "mountNamespace": torch.randint(0, vocab_sizes["mount_ns_vocab_size"], (bs, 128)),
-            "eventId": torch.randint(0, vocab_sizes["event_id_vocab_size"], (bs, 128)),
-            "argsNum": torch.randn(bs, 128),
-            "returnValue": torch.randn(bs, 128),
-            "parentProcessId": torch.randn(bs, 128),
-        }
-        model.eval()
-        with torch.no_grad():
-            reconstructed, mu, logvar = model(batch)
-        assert reconstructed.shape == (bs, 128, model.event_dim), \
-            f"Batch size {bs}: unexpected shape {reconstructed.shape}"
-
-
-def test_padding_idx_zero_maps_to_zeros(model):
-    """Embedding for padding_idx=0 should be all zeros."""
-    weight = model.process_name_embed.weight
-    assert (weight[0] == 0).all(), "Padding embedding at index 0 should be all zeros"
-
-
-def test_init_kwargs_saved(model, vocab_sizes):
-    """Model should save its init kwargs for serialization."""
-    kwargs = model._init_kwargs
-    assert kwargs["process_name_vocab_size"] == vocab_sizes["process_name_vocab_size"]
-    assert kwargs["args_vocab_size"] == vocab_sizes["args_vocab_size"]
-    assert kwargs["hidden_size"] == 128
-    assert kwargs["latent_dim"] == 32
-    assert kwargs["num_layers"] == 2
-    assert kwargs["dropout"] == 0.3
-
-
-# ── Reparameterization ───────────────────────────────────────────────────────
-
-def test_reparameterize_produces_different_samples(model):
-    """Reparameterization should produce different samples each time."""
-    mu = torch.zeros(4, model.latent_dim)
-    logvar = torch.zeros(4, model.latent_dim)
-    z1 = model.reparameterize(mu, logvar)
-    z2 = model.reparameterize(mu, logvar)
-    # Different samples (with overwhelming probability)
-    assert not torch.allclose(z1, z2), "Reparameterize should produce different samples"
-
-
-def test_reparameterize_deterministic_with_zero_variance(model):
-    """With logvar → -inf (zero variance), reparameterize should return mu."""
-    mu = torch.randn(4, model.latent_dim)
-    logvar = torch.full((4, model.latent_dim), -20.0)  # very small variance
-    z = model.reparameterize(mu, logvar)
-    torch.testing.assert_close(z, mu, atol=1e-4, rtol=1e-4)
-
-
-# ── Reconstruction Error ─────────────────────────────────────────────────────
-
-def test_reconstruction_error_shape(model, sample_batch):
-    """reconstruction_error should return per-sample MSE of shape (B,)."""
-    model.eval()
-    with torch.no_grad():
-        mse = model.reconstruction_error(sample_batch)
-    batch_size = sample_batch["userId"].shape[0]
-    assert mse.shape == (batch_size,), f"Expected ({batch_size},), got {mse.shape}"
-
-
-def test_reconstruction_error_is_positive(model, sample_batch):
-    """MSE should be non-negative and finite."""
-    model.eval()
-    with torch.no_grad():
-        mse = model.reconstruction_error(sample_batch)
-    assert (mse >= 0).all(), f"Negative MSE: {mse}"
-    assert torch.isfinite(mse).all(), f"Non-finite MSE: {mse}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CenteredWindowDataset Tests
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _make_features(n_events: int):
-    """Build a minimal synthetic feature dict for n_events."""
-    return {
-        "processName_ids": np.zeros((n_events, 16), dtype=np.int64),
-        "args_ids": np.zeros((n_events, 64), dtype=np.int64),
-        "userId": np.zeros(n_events, dtype=np.int64),
-        "mountNamespace": np.zeros(n_events, dtype=np.int64),
-        "eventId": np.zeros(n_events, dtype=np.int64),
-        "argsNum": np.zeros(n_events, dtype=np.float32),
-        "returnValue": np.zeros(n_events, dtype=np.float32),
-        "parentProcessId": np.zeros(n_events, dtype=np.float32),
-    }
-
-
-# ── Basic Construction ────────────────────────────────────────────────────────
-
-def test_centered_dataset_single_host():
-    """Single host with more than window_size events should produce windows."""
-    n = 1024
-    features = _make_features(n)
-    labels = np.zeros(n, dtype=np.int64)
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=32)
-    # Valid centers: positions 256 .. 767 (512 positions), stride 32 → 16 windows
-    assert len(ds) == 16
-
-
-def test_centered_dataset_stride_one():
-    """Stride=1 should produce one window per valid center."""
-    n = 1024
-    features = _make_features(n)
-    labels = np.zeros(n, dtype=np.int64)
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=1)
-    # Valid centers: 512 positions
-    assert len(ds) == 512
-
-
-def test_centered_dataset_multiple_hosts():
-    """Windows should not cross host boundaries."""
-    n_events_per_host = 600
-    features = _make_features(n_events_per_host * 2)
-    labels = np.zeros(n_events_per_host * 2, dtype=np.int64)
-    host_lengths = [n_events_per_host, n_events_per_host]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=32)
-    # Each host: valid centers 256..343 (88 positions), stride 32 → 3 windows each
-    assert len(ds) == 6
-
-
-def test_centered_dataset_host_too_small():
-    """A host smaller than window_size contributes zero windows."""
-    features = _make_features(300)
-    labels = np.zeros(300, dtype=np.int64)
-    host_lengths = [300]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=32)
-    assert len(ds) == 0
-
-
-def test_centered_dataset_mixed_host_sizes():
-    """Only the large-enough host contributes windows."""
-    features = _make_features(1100)  # 600 + 500
-    labels = np.zeros(1100, dtype=np.int64)
-    host_lengths = [600, 500]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=32)
-    # Host 1 (600): 88 centers, stride 32 → 3 windows
-    # Host 2 (500): not enough → 0 windows
-    assert len(ds) == 3
-
-
-# ── Label Correctness ─────────────────────────────────────────────────────────
-
-def test_label_is_center_event():
-    """Label must be the center event's value, not any() in window."""
-    n = 1024
-    features = _make_features(n)
-    labels = np.zeros(n, dtype=np.int64)
-    # Place evil at position 400
-    labels[400] = 1
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=32)
-
-    # Find the window centered on position 400 (or close to it)
-    for i in range(len(ds)):
-        _, lbl = ds[i]
-        center_pos = ds.centers[i]
-        if center_pos == 400:
-            assert lbl.item() == 1.0, f"Center at evil position {center_pos} should have label 1"
-        elif center_pos == 384 or center_pos == 416:
-            # Stride=32 neighbors might or might not include evil
-            pass
-
-
-def test_benign_center_in_evil_neighborhood():
-    """A benign event surrounded by evil neighbors should have label 0."""
-    n = 1024
-    features = _make_features(n)
-    labels = np.ones(n, dtype=np.int64)  # all evil
-    labels[400] = 0  # one benign in the middle
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=1)
-
-    # The window centered on 400 should have label 0 even though
-    # most of the window is evil
-    for i in range(len(ds)):
-        _, lbl = ds[i]
-        center_pos = ds.centers[i]
-        if center_pos == 400:
-            assert lbl.item() == 0.0, (
-                f"Benign center at {center_pos} should have label 0 "
-                f"(window-level any() would label this 1)"
-            )
-            return
-    pytest.fail("Center at position 400 not found in dataset")
-
-
-# ── Window Content ────────────────────────────────────────────────────────────
-
-def test_window_content_matches_slice():
-    """Window tensors should match the expected numpy slice."""
-    n = 1024
-    features = _make_features(n)
-    # Use a non-zero feature to verify correct slicing
-    features["argsNum"] = np.arange(n, dtype=np.float32)
-    labels = np.zeros(n, dtype=np.int64)
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=1)
-
-    center = 512  # pick a center
-    # Find index for this center
-    for i in range(len(ds)):
-        if ds.centers[i] == center:
-            x, _ = ds[i]
-            expected = np.arange(center - 256, center + 256, dtype=np.float32)
-            actual = x["argsNum"].numpy()
-            np.testing.assert_array_equal(actual, expected)
-            return
-    pytest.fail(f"Center {center} not found")
-
-
-def test_sequence_window_does_not_cross_hosts():
-    """The first event of host 2 should never appear in a host-1 window."""
-    n1, n2 = 600, 600
-    features = _make_features(n1 + n2)
-    features["argsNum"] = np.arange(n1 + n2, dtype=np.float32)
-    labels = np.zeros(n1 + n2, dtype=np.int64)
-    host_lengths = [n1, n2]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=1)
-
-    # The last center in host 1 is at n1 - 256 - 1 = 343
-    # Its window spans [343-256, 343+256) = [87, 599) — all within host 1 (< 600)
-    max_window_end = 0
-    for i in range(len(ds)):
-        center = ds.centers[i]
-        if center < n1:
-            # All centers in host 1 should produce windows fully within host 1
-            window_end = center + 256
-            assert window_end <= n1, (
-                f"Window centered at {center} ends at {window_end}, "
-                f"crossing into host 2 (boundary at {n1})"
-            )
-            max_window_end = max(max_window_end, window_end)
-    assert max_window_end <= n1
-
-
-# ── Edge Handling ─────────────────────────────────────────────────────────────
-
-def test_truncate_edges_no_padding():
-    """Events without 256 neighbors should not be centers (truncate)."""
-    n = 600
-    features = _make_features(n)
-    labels = np.arange(n, dtype=np.int64)  # unique labels per position
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=1)
-
-    # First valid center = 256, last valid center = 600 - 256 - 1 = 343
-    for center in ds.centers:
-        assert center >= 256, f"Center {center} too close to start (needs >= 256)"
-        assert center <= 343, f"Center {center} too close to end (needs <= {n - 256 - 1})"
-
-
-def test_all_centers_different_window():
-    """Stride=1: every consecutive center should have a different window slice."""
-    n = 1024
-    features = _make_features(n)
-    features["argsNum"] = np.arange(n, dtype=np.float32)
-    labels = np.zeros(n, dtype=np.int64)
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=1)
-
-    # First two windows should differ by exactly 1 event at each end
-    x0, _ = ds[0]
-    x1, _ = ds[1]
-    # x1 should be shifted by 1 compared to x0
-    expected_x1 = np.arange(1, 513, dtype=np.float32)
-    np.testing.assert_array_equal(x1["argsNum"].numpy(), expected_x1)
-
-
-# ── Stride Variants ───────────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("stride,expected", [
-    (1, 512),    # (1024-512)/1
-    (32, 16),    # (1024-512)/32 = 16
-    (64, 8),     # (1024-512)/64 = 8
-    (128, 4),    # (1024-512)/128 = 4
-    (256, 2),    # (1024-512)/256 = 2
-])
-def test_stride_variants(stride, expected):
-    """Different strides should produce the correct number of windows."""
-    n = 1024
-    features = _make_features(n)
-    labels = np.zeros(n, dtype=np.int64)
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=stride)
-    assert len(ds) == expected, f"Stride {stride}: expected {expected}, got {len(ds)}"
-
-
-# ── Dataset Properties ────────────────────────────────────────────────────────
-
-def test_centered_dataset_stores_host_lengths():
-    """CenteredWindowDataset should expose host_lengths for downstream use."""
-    n = 1024
-    features = _make_features(n)
-    labels = np.zeros(n, dtype=np.int64)
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=32)
-    assert ds.host_lengths == host_lengths
-
-
-def test_all_labels_zeroorone():
-    """Labels should always be 0.0 or 1.0 (float32)."""
-    n = 1024
-    features = _make_features(n)
-    labels = np.array([0, 1] * (n // 2), dtype=np.int64)
-    host_lengths = [n]
-    ds = CenteredWindowDataset(features, labels, host_lengths, window_size=512, stride=32)
-    for i in range(len(ds)):
-        _, lbl = ds[i]
-        assert lbl.item() in {0.0, 1.0}, f"Unexpected label: {lbl.item()}"
+def test_target_fields(model):
+    """The model must predict exactly the five ADR-0004 fields."""
+    assert set(model.target_fields) == {"eventId", "processName", "userId", "returnValue", "argsNum"}
