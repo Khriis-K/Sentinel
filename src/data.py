@@ -404,6 +404,74 @@ def preprocess_features(
     return features, computed_stats
 
 
+# ── Next-Event Targets ─────────────────────────────────────────────────────────
+
+# The five fields predicted by the next-event model, one cross-entropy head
+# per field. args content, mountNamespace, and parentProcessId are excluded
+# from targets (UNK-flooding / dropped / instance-specific noise) per ADR-0004.
+TARGET_FIELDS = ("eventId", "processName", "userId", "returnValue", "argsNum")
+
+
+# ── Trailing-Window Dataset ────────────────────────────────────────────────────
+
+class TrailingWindowDataset(Dataset):
+    """Per-event dataset: trailing 512-event context → next event.
+
+    Event ``i``'s context is the window of ``window_size`` events immediately
+    preceding it (positions ``i − window_size … i − 1``); the prediction
+    target is event ``i`` itself. Contexts never cross host boundaries, and
+    events without a full trailing context within their host are skipped
+    (truncate — no padding).
+
+    ``stride`` subsamples target positions (dense stride=1 for evaluation).
+
+    Yields (context, targets) tuples where:
+      - context is a dict of int64 tensors, each with ``window_size`` in dim 0
+      - targets is a dict of scalar int64 tensors, one per TARGET_FIELDS entry
+    """
+
+    def __init__(
+        self,
+        features: Dict[str, np.ndarray],
+        host_lengths: List[int],
+        window_size: int = 512,
+        stride: int = 1,
+    ):
+        self.features = features
+        self.host_lengths = host_lengths
+        self.window_size = window_size
+        self.stride = stride
+
+        # A position is a valid target if it has a full window of preceding
+        # events within the same host: first target of a host is at
+        # offset + window_size, and the host must have at least one event
+        # past it.
+        self.centers: List[int] = []
+        offset = 0
+        for host_n in host_lengths:
+            first = offset + window_size
+            last = offset + host_n  # exclusive
+            self.centers.extend(range(first, last, stride))
+            offset += host_n
+
+    def __len__(self) -> int:
+        return len(self.centers)
+
+    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        center = self.centers[idx]
+        start = center - self.window_size
+
+        context = {
+            key: torch.from_numpy(arr[start:center])
+            for key, arr in self.features.items()
+        }
+        targets = {
+            field: torch.tensor(int(self.features[field][center]), dtype=torch.int64)
+            for field in TARGET_FIELDS
+        }
+        return context, targets
+
+
 # ── PyTorch Dataset ────────────────────────────────────────────────────────────
 
 class BethDataset(Dataset):

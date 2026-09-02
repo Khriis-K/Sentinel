@@ -17,6 +17,8 @@ from src.data import (
     map_categorical,
     bucket_return_value,
     bucket_args_num,
+    TrailingWindowDataset,
+    TARGET_FIELDS,
     tokenize_texts,
     preprocess_features,
     BethDataset,
@@ -370,6 +372,165 @@ def test_preprocess_features_reuses_stats(sample_df):
     # val_stats should equal train_stats (not recomputed from val)
     for key in train_stats:
         assert val_stats[key] == train_stats[key], f"{key} stats differ"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TrailingWindowDataset Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _make_features(n_events: int):
+    """Build a synthetic feature dict matching the next-event preprocessing."""
+    return {
+        "processName": np.zeros(n_events, dtype=np.int64),
+        "args_ids": np.zeros((n_events, 64), dtype=np.int64),
+        "userId": np.zeros(n_events, dtype=np.int64),
+        "eventId": np.zeros(n_events, dtype=np.int64),
+        "argsNum": np.zeros(n_events, dtype=np.int64),
+        "returnValue": np.zeros(n_events, dtype=np.int64),
+        "parentProcessId": np.zeros(n_events, dtype=np.int64),
+    }
+
+
+def test_trailing_dataset_single_host():
+    """Single host: every event with a full trailing context is a target."""
+    n = 1024
+    features = _make_features(n)
+    host_lengths = [n]
+    ds = TrailingWindowDataset(features, host_lengths, window_size=512, stride=1)
+    # Valid targets: positions 512 .. 1023 (512 positions)
+    assert len(ds) == 512
+
+
+def test_trailing_dataset_stride_one():
+    """Stride=1 should produce one example per valid target."""
+    n = 1024
+    features = _make_features(n)
+    ds = TrailingWindowDataset(features, [n], window_size=512, stride=1)
+    assert len(ds) == 512
+
+
+def test_trailing_dataset_host_too_small():
+    """A host with no event past the first full window contributes nothing."""
+    features = _make_features(300)
+    ds = TrailingWindowDataset(features, [300], window_size=512, stride=1)
+    assert len(ds) == 0
+
+
+def test_trailing_dataset_exactly_window_size():
+    """A host with exactly window_size events has no target (needs one more)."""
+    features = _make_features(512)
+    ds = TrailingWindowDataset(features, [512], window_size=512, stride=1)
+    assert len(ds) == 0
+
+
+def test_trailing_dataset_multiple_hosts():
+    """Windows must not cross host boundaries."""
+    n_per_host = 600
+    features = _make_features(n_per_host * 2)
+    ds = TrailingWindowDataset(
+        features, [n_per_host, n_per_host], window_size=512, stride=32
+    )
+    # Each host: targets 512..599 (88 positions), stride 32 → 3 each
+    assert len(ds) == 6
+
+
+def test_trailing_dataset_mixed_host_sizes():
+    """Only hosts with room for context + target contribute examples."""
+    features = _make_features(1100)  # 600 + 500
+    ds = TrailingWindowDataset(features, [600, 500], window_size=512, stride=32)
+    # Host 1 (600): 3 windows; Host 2 (500): too small
+    assert len(ds) == 3
+
+
+def test_trailing_dataset_first_center_is_window_size():
+    """First target of a host must sit exactly one window into the stream."""
+    n = 700
+    features = _make_features(n)
+    ds = TrailingWindowDataset(features, [n], window_size=512, stride=1)
+    assert ds.centers[0] == 512
+    assert ds.centers[-1] == n - 1
+
+
+def test_trailing_dataset_window_content_matches_slice():
+    """Context tensors must equal the trailing slice before the target."""
+    n = 1024
+    features = _make_features(n)
+    features["argsNum"] = np.arange(n, dtype=np.int64)
+    ds = TrailingWindowDataset(features, [n], window_size=512, stride=1)
+
+    center = 800
+    idx = ds.centers.index(center)
+    context, targets = ds[idx]
+    expected = np.arange(center - 512, center, dtype=np.int64)
+    np.testing.assert_array_equal(context["argsNum"].numpy(), expected)
+    assert targets["argsNum"].item() == center
+
+
+def test_trailing_dataset_targets_are_center_event_fields():
+    """Target dict must carry the five predicted fields at the target position."""
+    n = 1024
+    features = _make_features(n)
+    features["eventId"] = np.arange(n, dtype=np.int64)
+    features["processName"] = np.arange(n, dtype=np.int64) % 50
+    features["userId"] = np.arange(n, dtype=np.int64) % 10
+    features["returnValue"] = np.full(n, 3, dtype=np.int64)
+    features["argsNum"] = np.arange(n, dtype=np.int64) % 16
+    ds = TrailingWindowDataset(features, [n], window_size=512, stride=1)
+
+    center = 900
+    idx = ds.centers.index(center)
+    _, targets = ds[idx]
+    assert set(targets.keys()) == set(TARGET_FIELDS)
+    for field in TARGET_FIELDS:
+        assert targets[field].item() == int(features[field][center])
+
+
+def test_trailing_dataset_window_never_crosses_hosts():
+    """No context may reach into the neighbouring host's events."""
+    n1, n2 = 600, 600
+    features = _make_features(n1 + n2)
+    features["argsNum"] = np.arange(n1 + n2, dtype=np.int64)
+    ds = TrailingWindowDataset(features, [n1, n2], window_size=512, stride=1)
+
+    for i in range(len(ds)):
+        center = ds.centers[i]
+        start = center - 512
+        if center < n1:
+            assert start >= 0, f"Host-1 window starts at {start} (before stream)"
+        else:
+            assert start >= n1, (
+                f"Window for target {center} starts at {start}, "
+                f"crossing into host 1 (boundary at {n1})"
+            )
+
+
+def test_trailing_dataset_context_length_is_window_size():
+    """Every context must have exactly window_size events in dim 0."""
+    n = 1024
+    features = _make_features(n)
+    ds = TrailingWindowDataset(features, [n], window_size=512, stride=7)
+    for i in range(0, len(ds), 37):
+        context, _ = ds[i]
+        for key, tensor in context.items():
+            assert tensor.shape[0] == 512, (
+                f"{key} at example {i} has shape {tensor.shape}"
+            )
+
+
+@pytest.mark.parametrize("stride,expected", [
+    (1, 512),    # dense: one example per valid target
+    (32, 16),    # (1024-512)/32 = 16
+    (64, 8),     # (1024-512)/64 = 8
+    (128, 4),    # (1024-512)/128 = 4
+    (256, 2),    # (1024-512)/256 = 2
+])
+def test_trailing_dataset_stride_variants(stride, expected):
+    """Different strides should produce the correct number of examples."""
+    n = 1024
+    features = _make_features(n)
+    ds = TrailingWindowDataset(features, [n], window_size=512, stride=stride)
+    assert len(ds) == expected, f"Stride {stride}: expected {expected}, got {len(ds)}"
 
 
 # ── PyTorch Dataset ────────────────────────────────────────────────────────────
