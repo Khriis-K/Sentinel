@@ -163,37 +163,94 @@ def validate_epoch(
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate_model(
+def collect_scores(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> Dict[str, object]:
-    """Compute all evaluation metrics using reconstruction error as anomaly score.
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Collect reconstruction error scores and labels from a DataLoader.
 
-    Returns dict with: pr_auc, auroc, f1, precision, recall, confusion_matrix.
+    Returns:
+        (scores, y_true) as numpy arrays.
     """
     model.eval()
     all_scores = []
     all_labels = []
+    n_batches = len(loader)
 
-    for features, labels in loader:
+    for i, (features, labels) in enumerate(loader):
         features = {k: v.to(device) for k, v in features.items()}
 
-        # Reconstruction error per sample
         event_vec, mu, logvar = model.encode(features)
         z = model.reparameterize(mu, logvar)
         seq_len = event_vec.size(1)
         reconstructed = model.decode(z, seq_len)
 
-        # Per-sample MSE (mean over sequence and feature dims)
         mse = ((reconstructed - event_vec) ** 2).mean(dim=(1, 2))
         all_scores.append(mse.cpu())
         all_labels.append(labels.squeeze(1).cpu())
 
+        if (i + 1) % 500 == 0 or i + 1 == n_batches:
+            print(f"    batch {i+1}/{n_batches}", flush=True)
+
     scores = torch.cat(all_scores).numpy()
     y_true = torch.cat(all_labels).numpy().astype(np.int64)
+    return scores, y_true
 
-    # If all labels are the same, some metrics are undefined
+
+def find_optimal_threshold(
+    scores: np.ndarray,
+    y_true: np.ndarray,
+) -> Tuple[float, Dict[str, float]]:
+    """Find the threshold that maximizes F1 on the given scores/labels.
+
+    Sweeps 200 candidate thresholds between the 1st and 99th percentile
+    of scores and picks the one with the best F1.
+
+    Returns:
+        (best_threshold, metrics_dict) where metrics_dict has f1, precision,
+        recall at the chosen threshold.
+    """
+    candidates = np.percentile(scores, np.linspace(1, 99, 200))
+    best_f1 = -1.0
+    best_threshold = candidates[0]
+    best_metrics = {}
+
+    for t in candidates:
+        y_pred = (scores >= t).astype(np.int64)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = t
+            best_metrics = {
+                "f1": float(f1),
+                "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+                "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+            }
+
+    return float(best_threshold), best_metrics
+
+
+@torch.no_grad()
+def evaluate_model(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    threshold: Optional[float] = None,
+) -> Dict[str, object]:
+    """Compute all evaluation metrics using reconstruction error as anomaly score.
+
+    Args:
+        model: Trained SentinelVAE.
+        loader: DataLoader to evaluate on.
+        device: Torch device.
+        threshold: Decision threshold. If None, uses median of scores.
+
+    Returns dict with: pr_auc, auroc, f1, precision, recall, confusion_matrix,
+        threshold.
+    """
+    scores, y_true = collect_scores(model, loader, device)
+
     if len(np.unique(y_true)) < 2:
         return {
             "pr_auc": 0.0,
@@ -202,10 +259,12 @@ def evaluate_model(
             "precision": 0.0,
             "recall": 0.0,
             "confusion_matrix": [[int((y_true == 0).sum()), 0], [int((y_true == 1).sum()), 0]],
+            "threshold": 0.0,
         }
 
-    # Threshold at median of scores (tune on validation set in practice)
-    threshold = np.median(scores)
+    if threshold is None:
+        threshold = float(np.median(scores))
+
     y_pred = (scores >= threshold).astype(np.int64)
 
     auroc = float(roc_auc_score(y_true, scores))
@@ -222,6 +281,7 @@ def evaluate_model(
         "precision": precision,
         "recall": recall,
         "confusion_matrix": cm,
+        "threshold": threshold,
     }
 
 
@@ -235,6 +295,7 @@ def evaluate_per_event(
     device: torch.device,
     window_size: int = 512,
     batch_size: int = 256,
+    threshold: Optional[float] = None,
 ) -> Dict[str, object]:
     """Score every valid center event using dense (stride=1) centered windows.
 
@@ -251,9 +312,11 @@ def evaluate_per_event(
         device: Torch device.
         window_size: Events per window (default 512).
         batch_size: Batch size for inference.
+        threshold: Decision threshold. If None, uses median of scores.
 
     Returns:
-        Dict with pr_auc, auroc, f1, precision, recall, confusion_matrix.
+        Dict with pr_auc, auroc, f1, precision, recall, confusion_matrix,
+        threshold.
     """
     ds = CenteredWindowDataset(
         features, labels, host_lengths,
@@ -262,7 +325,7 @@ def evaluate_per_event(
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,
     )
-    return evaluate_model(model, loader, device)
+    return evaluate_model(model, loader, device, threshold=threshold)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -416,6 +479,20 @@ def main(
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    # ── Threshold tuning on mixed-val set ───────────────────────────────────
+    optimal_threshold = None
+    if mixed_val_loader is not None and len(mixed_val_ds) > 0:
+        print("\nTuning threshold on mixed-val set...")
+        val_scores, val_labels = collect_scores(model, mixed_val_loader, device)
+        optimal_threshold, val_threshold_metrics = find_optimal_threshold(
+            val_scores, val_labels,
+        )
+        print(f"  Optimal threshold: {optimal_threshold:.6f}")
+        print(f"  Mixed-val @ threshold: "
+              f"F1={val_threshold_metrics['f1']:.4f}, "
+              f"Precision={val_threshold_metrics['precision']:.4f}, "
+              f"Recall={val_threshold_metrics['recall']:.4f}")
+
     # ── Per-event evaluation on test split ──────────────────────────────────
     print("\nPer-event evaluation on test split (stride=1, every center event)...")
     test_labels = test_ds.labels
@@ -423,6 +500,7 @@ def main(
     bilstm_metrics = evaluate_per_event(
         model, test_ds.features, test_labels, test_host_lengths,
         device, window_size=window_size, batch_size=batch_size * 4,
+        threshold=optimal_threshold,
     )
 
     print(f"  PR-AUC:     {bilstm_metrics['pr_auc']:.4f}  (primary)")
@@ -430,6 +508,7 @@ def main(
     print(f"  F1:         {bilstm_metrics['f1']:.4f}")
     print(f"  Precision:  {bilstm_metrics['precision']:.4f}")
     print(f"  Recall:     {bilstm_metrics['recall']:.4f}")
+    print(f"  Threshold:  {bilstm_metrics.get('threshold', 'N/A')}")
     print(f"  Confusion:  {bilstm_metrics['confusion_matrix']}")
 
     # ── Run paper baselines on per-host test data ───────────────────────────
