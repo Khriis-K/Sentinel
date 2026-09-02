@@ -13,6 +13,8 @@ from src.data import (
     load_beth_data,
     split_by_host,
     build_vocab,
+    build_categorical_vocab,
+    map_categorical,
     tokenize_texts,
     preprocess_features,
     BethDataset,
@@ -168,6 +170,48 @@ def test_build_vocab_respects_max_tokens():
     texts = pd.Series([" ".join(str(i) for i in range(1000))])
     vocab = build_vocab(texts, max_tokens=50)
     assert len(vocab) <= 50
+
+
+# ── Categorical Vocabulary ─────────────────────────────────────────────────────
+
+def test_categorical_vocab_real_zero_gets_own_index():
+    """Real value 0 must map to its own index, distinct from the OOV index.
+
+    Root (userId=0) is 95-99% of BETH rows — if 0 collided with OOV,
+    root would be indistinguishable from unseen users.
+    """
+    series = pd.Series([0, 0, 0, 1, 1, 2])
+    vocab = build_categorical_vocab(series)
+
+    assert 0 in vocab, "Real value 0 must be present in the vocab"
+    assert vocab[0] != 0, "Real value 0 must not collide with the OOV index"
+
+
+def test_categorical_vocab_unseen_maps_to_oov():
+    """Values not in the vocab must map to the reserved OOV index 0."""
+    series = pd.Series([0, 0, 5, 5, 7])
+    vocab = build_categorical_vocab(series)
+
+    mapped = map_categorical(pd.Series([0, 5, 7, 999]), vocab)
+    assert mapped[0] != 0, "Seen value 0 must not map to OOV"
+    assert mapped[1] != 0 and mapped[2] != 0, "Seen values must not map to OOV"
+    assert mapped[3] == 0, "Unseen value 999 must map to OOV index 0"
+
+
+def test_categorical_vocab_deterministic():
+    """Same input series must produce an identical vocab, ties included."""
+    series = pd.Series([3, 3, 3, 1, 1, 2, 2, 9, 9, 9])
+    v1 = build_categorical_vocab(series)
+    v2 = build_categorical_vocab(series)
+    assert v1 == v2
+
+
+def test_categorical_vocab_indices_are_contiguous():
+    """Assigned indices must be 1..n with no gaps (0 reserved for OOV)."""
+    series = pd.Series([10, 10, 20, 20, 30, 40])
+    vocab = build_categorical_vocab(series)
+    indices = sorted(vocab.values())
+    assert indices == list(range(1, len(vocab) + 1))
 
 
 # ── Tokenization ───────────────────────────────────────────────────────────────

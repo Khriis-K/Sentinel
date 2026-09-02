@@ -127,27 +127,32 @@ def _get_labels(df: pd.DataFrame) -> np.ndarray:
 def build_categorical_vocab(series: pd.Series, max_size: int = 50000) -> Dict[int, int]:
     """Build a value→index mapping for categorical integer features.
 
-    Maps unique integer values to contiguous indices, reserving 0 for unseen/OOV.
-    Useful for high-cardinality integer features like mountNamespace or userId
-    where raw values can be sparse 32-bit integers.
+    Index 0 is reserved for out-of-vocabulary (unseen) values and is never
+    assigned to a real value — real value 0 (e.g. root userId) gets its own
+    index like any other value. Real values are assigned indices 1..n in
+    descending frequency order, ties broken by ascending value so the mapping
+    is deterministic.
 
     Args:
         series: Integer feature values.
-        max_size: Maximum number of unique values to keep (most frequent).
+        max_size: Maximum number of unique real values to keep (most frequent).
 
     Returns:
-        Dict mapping original integer value → contiguous index.
+        Dict mapping original integer value → index (indices start at 1).
     """
     value_counts = series.fillna(0).astype(np.int64).value_counts()
-    vocab: Dict[int, int] = {0: 0}  # reserve 0 for unseen
+    # Sort by frequency desc, then value asc — value_counts alone does not
+    # guarantee tie order, which would make the vocab non-deterministic.
+    ordered = sorted(
+        ((int(val), int(count)) for val, count in value_counts.items()),
+        key=lambda vc: (-vc[1], vc[0]),
+    )
 
-    for val in value_counts.index:
+    vocab: Dict[int, int] = {}
+    for val, _ in ordered:
         if len(vocab) >= max_size:
             break
-        int_val = int(val)
-        if int_val == 0:
-            continue  # already mapped
-        vocab[int_val] = len(vocab)
+        vocab[val] = len(vocab) + 1  # 0 reserved for OOV
 
     return vocab
 
@@ -155,7 +160,7 @@ def build_categorical_vocab(series: pd.Series, max_size: int = 50000) -> Dict[in
 def map_categorical(series: pd.Series, vocab: Dict[int, int]) -> np.ndarray:
     """Map a Series of integer values through a categorical vocabulary.
 
-    Values not in the vocab default to index 0.
+    Values not in the vocab map to the reserved OOV index 0.
 
     Args:
         series: Integer feature values.
@@ -164,9 +169,8 @@ def map_categorical(series: pd.Series, vocab: Dict[int, int]) -> np.ndarray:
     Returns:
         int64 numpy array of mapped indices.
     """
-    default = vocab.get(0, 0)
     return np.array(
-        [vocab.get(int(v), default) for v in series.fillna(0)],
+        [vocab.get(int(v), 0) for v in series.fillna(0)],
         dtype=np.int64,
     )
 
