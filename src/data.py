@@ -24,8 +24,6 @@ BETH_COLUMNS = [
     "stackAddresses", "args",
 ]
 
-METRIC_KEYS = ["auroc", "pr_auc", "f1", "precision", "recall"]
-
 
 # ── Loading ────────────────────────────────────────────────────────────────────
 

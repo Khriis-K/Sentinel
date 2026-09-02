@@ -1,56 +1,24 @@
 """
 Sentinel — Baseline Models
-Reproduces the three anomaly detection baselines from the BETH paper
+The three anomaly detection baselines from the BETH paper
 (Highnam et al., 2021): Isolation Forest, Robust Covariance, One-Class SVM.
+
+Baselines contribute RAW anomaly scores only — thresholds are tuned on the
+attack-val carve-out with the same procedure as the neural model
+(src.eval), never via the paper's contamination constant.
 
 Paper reported results (on the 7-feature binarized subset):
   - iForest: 0.850 AUROC
   - Robust Covariance: 0.519 AUROC
   - One-Class SVM: 0.605 AUROC
 """
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.covariance import EllipticEnvelope
 from sklearn.svm import OneClassSVM
-from sklearn.metrics import (
-    roc_auc_score,
-    average_precision_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    confusion_matrix,
-)
-from sklearn.preprocessing import StandardScaler
-
-from src.data import METRIC_KEYS
-
-
-# ── Data Classes ───────────────────────────────────────────────────────────────
-
-@dataclass
-class BaselineResults:
-    """Container for baseline evaluation results."""
-    iforest: Dict[str, object] = field(default_factory=dict)
-    robust_covariance: Dict[str, object] = field(default_factory=dict)
-    one_class_svm: Dict[str, object] = field(default_factory=dict)
-
-    def to_dataframe(self) -> pd.DataFrame:
-        """Convert results to a comparison DataFrame."""
-        rows = []
-        for name, metrics in [
-            ("iForest", self.iforest),
-            ("Robust Covariance", self.robust_covariance),
-            ("One-Class SVM", self.one_class_svm),
-        ]:
-            row = {"model": name}
-            for k in METRIC_KEYS:
-                row[k] = metrics.get(k)
-            rows.append(row)
-        return pd.DataFrame(rows)
 
 
 # ── Training Functions ─────────────────────────────────────────────────────────
@@ -63,9 +31,12 @@ def train_iforest(
 ) -> IsolationForest:
     """Train an Isolation Forest model on benign training data.
 
+    ``contamination`` only shifts sklearn's decision_function by a constant
+    here — ranking and the attack-val-tuned threshold are unaffected.
+
     Args:
         X: Feature array of shape (n_samples, n_features).
-        contamination: Expected fraction of anomalies.
+        contamination: Expected fraction of anomalies (sklearn parameter).
         n_estimators: Number of trees in the forest.
         seed: Random seed.
 
@@ -91,7 +62,7 @@ def train_robust_covariance(
 
     Args:
         X: Feature array of shape (n_samples, n_features).
-        contamination: Expected fraction of anomalies.
+        contamination: Expected fraction of anomalies (sklearn parameter).
         seed: Random seed.
 
     Returns:
@@ -127,100 +98,23 @@ def train_one_class_svm(
     return model
 
 
-# ── Evaluation ─────────────────────────────────────────────────────────────────
+# ── Scoring ────────────────────────────────────────────────────────────────────
 
-def evaluate_baseline(
-    model,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-    contamination: float = 0.01,
-) -> Dict[str, object]:
-    """Evaluate a fitted anomaly detection model on a held-out test set.
+def score_baseline(model, X: np.ndarray) -> np.ndarray:
+    """Raw anomaly scores from a fitted sklearn outlier detector.
 
-    Uses decision_function: lower scores = more anomalous.
-    We invert scores so higher = more anomalous for metric computation.
-    Threshold is set using the contamination parameter, not hardcoded.
+    decision_function is inverted so HIGHER = more anomalous, matching the
+    next-event surprisal convention. Thresholds are tuned downstream on
+    attack-val via src.eval — never set here.
 
     Args:
-        model: Fitted anomaly detection model with decision_function.
-        X_test: Test features (must NOT overlap with training data).
-        y_test: Ground truth labels (0 = benign, 1 = malicious).
-        contamination: Expected fraction of anomalies (used for threshold).
+        model: Fitted detector with decision_function.
+        X: Feature array to score.
 
     Returns:
-        Dict with auroc, pr_auc, f1, precision, recall, confusion_matrix.
+        float64 array of anomaly scores (higher = more anomalous).
     """
-    raw_scores = model.decision_function(X_test)
-    scores = -raw_scores  # invert: higher = more anomalous
-
-    auroc = roc_auc_score(y_test, scores)
-    pr_auc = average_precision_score(y_test, scores)
-
-    # Threshold from contamination: top contamination% → predicted anomaly
-    quantile = 1.0 - contamination
-    threshold = np.quantile(scores, quantile)
-    y_pred = (scores >= threshold).astype(np.int64)
-
-    f1 = f1_score(y_test, y_pred, zero_division=0)
-    precision = precision_score(y_test, y_pred, zero_division=0)
-    recall = recall_score(y_test, y_pred, zero_division=0)
-    cm = confusion_matrix(y_test, y_pred)
-
-    return {
-        "auroc": float(auroc),
-        "pr_auc": float(pr_auc),
-        "f1": float(f1),
-        "precision": float(precision),
-        "recall": float(recall),
-        "confusion_matrix": cm.tolist(),
-    }
-
-
-# ── Run All ────────────────────────────────────────────────────────────────────
-
-def run_all_baselines(
-    X_train: np.ndarray,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-    contamination: float = 0.01,
-    seed: int = 42,
-) -> BaselineResults:
-    """Run all three paper baselines with proper train/test separation.
-
-    Models are fitted on X_train (benign only, per BETH split) and
-    evaluated on X_test (which contains the attack host). This matches
-    the paper's evaluation protocol and prevents label leakage.
-
-    Args:
-        X_train: Training features (benign hosts only).
-        X_test: Test features (includes attack host).
-        y_test: Ground truth labels for test set.
-        contamination: Expected anomaly fraction.
-        seed: Random seed for iForest and Robust Covariance.
-
-    Returns:
-        BaselineResults with metrics for all three models.
-    """
-    # Fit scaler on training data only, transform both
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    results = BaselineResults()
-
-    # iForest
-    iforest = train_iforest(X_train_scaled, contamination=contamination, seed=seed)
-    results.iforest = evaluate_baseline(iforest, X_test_scaled, y_test, contamination)
-
-    # Robust Covariance
-    robust = train_robust_covariance(X_train_scaled, contamination=contamination, seed=seed)
-    results.robust_covariance = evaluate_baseline(robust, X_test_scaled, y_test, contamination)
-
-    # One-Class SVM
-    ocsvm = train_one_class_svm(X_train_scaled, nu=contamination)
-    results.one_class_svm = evaluate_baseline(ocsvm, X_test_scaled, y_test, contamination)
-
-    return results
+    return -np.asarray(model.decision_function(X), dtype=np.float64)
 
 
 # ── Paper-Reproduction Utility ─────────────────────────────────────────────────
@@ -230,6 +124,9 @@ def extract_paper_features(df: pd.DataFrame) -> np.ndarray:
 
     The paper used a subset of 7 features, binarized. This replicates
     that preprocessing for direct comparison against reported baselines.
+    Extraction is TRANSDUCTIVE (value counts computed over the df it is
+    given) — kept for comparability with the paper; the caveat is recorded
+    alongside baseline results.
 
     Paper features (7 binary):
       - processId (unique vs not)

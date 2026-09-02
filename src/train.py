@@ -184,13 +184,16 @@ def main(
     tune_frac: float = 0.2,
     seed: int = 42,
     evaluate: bool = True,
+    run_baselines: bool = True,
 ):
     """Run the next-event training pipeline.
 
     Loads per-host CSVs (benign hosts train/val, attack-val carved from
     test), trains the next-event LSTM on summed per-field cross-entropy,
     and saves model.pt. When ``evaluate``, tunes the decision threshold on
-    attack-val and evaluates dense stride-1 on test.
+    attack-val and evaluates dense stride-1 on test. When
+    ``run_baselines``, re-baselines the paper models under the same
+    protocol and adds them to eval_results.json.
     """
     # ── Setup ───────────────────────────────────────────────────────────────
     torch.manual_seed(seed)
@@ -381,6 +384,22 @@ def main(
             "tune_metrics": tune_metrics,
             "method": "maximize F1 over 1000 candidates spanning the full score range",
         }
+
+    # ── Paper baselines under the same protocol ──────────────────────────────
+    if run_baselines:
+        from src.baseline_protocol import run_baseline_comparison
+
+        eval_results["baselines"] = run_baseline_comparison(
+            data_dir=data_dir,
+            n_blocks=n_blocks,
+            tune_frac=tune_frac,
+            seed=seed,
+        )
+        print("\nBaseline comparison (same attack-val protocol):")
+        for name, m in eval_results["baselines"].items():
+            if isinstance(m, dict) and "auroc" in m:
+                print(f"  {name:20s} AUROC={m['auroc']:.4f} PR-AUC={m['pr_auc']:.4f} "
+                      f"P@1%={m['precision_at_1']:.4f}")
 
     # ── Save eval results ────────────────────────────────────────────────────
     eval_path = output_path / "eval_results.json"
