@@ -222,6 +222,103 @@ def bucket_args_num(series: pd.Series) -> np.ndarray:
     return np.clip(v, 0, ARGS_NUM_CLASSES - 1).astype(np.int64)
 
 
+# ── Attack-Val Carve-Out ───────────────────────────────────────────────────────
+
+def chunk_contiguous_blocks(n: int, n_blocks: int) -> List[Tuple[int, int]]:
+    """Split [0, n) into contiguous (start, end) blocks tiling the range.
+
+    Blocks are size-balanced and never overlap; their union is exactly
+    [0, n). When n < n_blocks, degrades to n single-event blocks.
+
+    Args:
+        n: Total number of positions.
+        n_blocks: Requested number of blocks.
+
+    Returns:
+        List of (start, end) tuples in ascending order.
+    """
+    n_blocks = max(1, min(n_blocks, n))
+    boundaries = np.linspace(0, n, n_blocks + 1).astype(np.int64)
+    return [
+        (int(boundaries[i]), int(boundaries[i + 1]))
+        for i in range(n_blocks)
+        if boundaries[i] < boundaries[i + 1]
+    ]
+
+
+def carve_attack_val(
+    test_df: pd.DataFrame,
+    n_blocks: int = 50,
+    tune_frac: float = 0.2,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Carve a threshold-tuning set out of the host-based test split.
+
+    Each test host's time-ordered event stream is cut into contiguous
+    blocks; a seeded draw assigns each block to the tuning set or leaves it
+    in test. Carved events are removed from test, so tune ∩ test = ∅ and
+    tune ∪ test = original. Blocks are atomic — a block is never split.
+
+    Guarantees (via fix-up): the tuning set contains evil events from every
+    evil test host and benign events from every benign test host, even when
+    the seeded draw misses them (e.g. an attack burst inside one block).
+
+    Args:
+        test_df: Test-split DataFrame (must contain 'hostName'; 'evil' and
+            'timestamp' used when present).
+        n_blocks: Contiguous blocks per host.
+        tune_frac: Probability each block is drawn into the tuning set.
+        seed: Random seed for block assignment.
+
+    Returns:
+        (tune_df, test_df) with carved rows removed from test.
+    """
+    rng = np.random.default_rng(seed)
+    tune_parts: List[pd.DataFrame] = []
+    test_parts: List[pd.DataFrame] = []
+
+    for host in sorted(test_df["hostName"].unique()):
+        host_df = test_df[test_df["hostName"] == host].copy()
+        if "timestamp" in host_df.columns:
+            host_df.sort_values("timestamp", kind="mergesort", inplace=True)
+        host_df.reset_index(drop=True, inplace=True)
+
+        blocks = chunk_contiguous_blocks(len(host_df), n_blocks)
+        evil_mask = (
+            (host_df["evil"] == 1).values
+            if "evil" in host_df.columns
+            else np.zeros(len(host_df), dtype=bool)
+        )
+        is_evil_host = bool(evil_mask.any())
+
+        assigned = rng.random(len(blocks)) < tune_frac
+
+        # Fix-up: guarantee evil coverage from this evil host in tune.
+        if is_evil_host:
+            has_evil_in_tune = any(
+                assigned[k] and evil_mask[s:e].any()
+                for k, (s, e) in enumerate(blocks)
+            )
+            if not has_evil_in_tune:
+                for k, (s, e) in enumerate(blocks):  # time order — deterministic
+                    if evil_mask[s:e].any():
+                        assigned[k] = True
+                        break
+
+        # Fix-up: guarantee benign-host representation in tune.
+        if not is_evil_host and not assigned.any():
+            assigned[0] = True
+
+        for k, (s, e) in enumerate(blocks):
+            part = host_df.iloc[s:e]
+            (tune_parts if assigned[k] else test_parts).append(part)
+
+    empty = test_df.iloc[0:0].copy()
+    tune_df = pd.concat(tune_parts, ignore_index=True) if tune_parts else empty
+    out_test_df = pd.concat(test_parts, ignore_index=True) if test_parts else empty
+    return tune_df, out_test_df
+
+
 # ── Vocabulary Building ────────────────────────────────────────────────────────
 
 def build_vocab(

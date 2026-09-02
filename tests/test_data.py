@@ -19,6 +19,8 @@ from src.data import (
     bucket_args_num,
     TrailingWindowDataset,
     TARGET_FIELDS,
+    chunk_contiguous_blocks,
+    carve_attack_val,
     tokenize_texts,
     preprocess_features,
     BethDataset,
@@ -531,6 +533,130 @@ def test_trailing_dataset_stride_variants(stride, expected):
     features = _make_features(n)
     ds = TrailingWindowDataset(features, [n], window_size=512, stride=stride)
     assert len(ds) == expected, f"Stride {stride}: expected {expected}, got {len(ds)}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Attack-Val Carve-Out Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _make_carve_df():
+    """Two evil hosts (small contiguous evil bursts) + one benign test host."""
+    frames = []
+    ts = 0.0
+    spec = [
+        ("evil-a", 2000, (500, 540)),   # evil burst of 40 inside 2000 events
+        ("benign-1", 1500, None),
+        ("evil-b", 800, (300, 315)),    # evil burst of 15 inside 800 events
+    ]
+    for host, n, evil_range in spec:
+        evil = np.zeros(n, dtype=np.int64)
+        if evil_range is not None:
+            evil[evil_range[0]:evil_range[1]] = 1
+        frames.append(pd.DataFrame({
+            "timestamp": np.arange(ts, ts + n, dtype=np.float64),
+            "processId": np.arange(n) % 1000,
+            "parentProcessId": np.ones(n, dtype=np.int64),
+            "userId": np.zeros(n, dtype=np.int64),
+            "processName": ["bash"] * n,
+            "hostName": [host] * n,
+            "eventId": np.ones(n, dtype=np.int64),
+            "eventName": ["execve"] * n,
+            "argsNum": np.ones(n, dtype=np.int64),
+            "returnValue": np.zeros(n, dtype=np.int64),
+            "args": ["-c"] * n,
+            "sus": np.zeros(n, dtype=np.int64),
+            "evil": evil,
+        }))
+        ts += n + 0.5
+    return pd.concat(frames, ignore_index=True)
+
+
+# ── Contiguous Blocks ──────────────────────────────────────────────────────────
+
+def test_chunk_blocks_tile_stream():
+    """Blocks must cover [0, n) with no gaps or overlaps."""
+    blocks = chunk_contiguous_blocks(1003, 50)
+    assert blocks[0][0] == 0
+    assert blocks[-1][1] == 1003
+    for (s1, e1), (s2, e2) in zip(blocks, blocks[1:]):
+        assert e1 == s2, f"Gap/overlap between ({s1},{e1}) and ({s2},{e2})"
+
+
+def test_chunk_blocks_fewer_events_than_blocks():
+    """n < n_blocks must degrade to single-event blocks, still tiling."""
+    blocks = chunk_contiguous_blocks(5, 50)
+    assert len(blocks) == 5
+    assert blocks[0][0] == 0 and blocks[-1][1] == 5
+
+
+# ── Carve-Out Behaviour ────────────────────────────────────────────────────────
+
+def test_carve_disjoint_and_complete():
+    """Tune and test must be disjoint and together preserve every row."""
+    df = _make_carve_df()
+    tune, test = carve_attack_val(df, seed=42)
+
+    assert len(tune) + len(test) == len(df)
+    tune_keys = set(zip(tune["hostName"], tune["timestamp"]))
+    test_keys = set(zip(test["hostName"], test["timestamp"]))
+    assert tune_keys.isdisjoint(test_keys), "A row landed in both tune and test"
+
+
+def test_carve_tune_has_evil_from_both_evil_hosts():
+    """The tuning set must contain evil events from every evil test host."""
+    df = _make_carve_df()
+    tune, _ = carve_attack_val(df, seed=7, tune_frac=0.05)  # tiny frac forces fix-up
+
+    for evil_host in ["evil-a", "evil-b"]:
+        host_evil = tune[(tune["hostName"] == evil_host) & (tune["evil"] == 1)]
+        assert len(host_evil) > 0, f"No evil from {evil_host} in tune set"
+
+
+def test_carve_tune_has_benign_from_benign_hosts():
+    """The tuning set must contain benign events from benign test hosts."""
+    df = _make_carve_df()
+    tune, _ = carve_attack_val(df, seed=0, tune_frac=0.01)  # extreme: ~no blocks drawn
+
+    host_benign = tune[(tune["hostName"] == "benign-1") & (tune["evil"] == 0)]
+    assert len(host_benign) > 0, "No benign events from benign-1 in tune set"
+
+
+def test_carve_never_splits_a_block():
+    """Every contiguous block must go wholly to tune or wholly to test."""
+    df = _make_carve_df()
+    tune, test = carve_attack_val(df, seed=42, n_blocks=25)
+
+    for host in df["hostName"].unique():
+        host_df = df[df["hostName"] == host].sort_values("timestamp").reset_index(drop=True)
+        tune_positions = host_df.index[
+            host_df.set_index(["hostName", "timestamp"]).index.isin(
+                set(zip(tune["hostName"], tune["timestamp"]))
+            )
+        ]
+        tune_pos = set(tune_positions)
+        for s, e in chunk_contiguous_blocks(len(host_df), 25):
+            in_tune = tune_pos.intersection(range(s, e))
+            assert len(in_tune) == 0 or len(in_tune) == e - s, (
+                f"Block ({s},{e}) of {host} was split between tune and test"
+            )
+
+
+def test_carve_deterministic_under_seed():
+    """Same seed must produce identical tune/test partitions."""
+    df = _make_carve_df()
+    tune1, test1 = carve_attack_val(df, seed=123)
+    tune2, test2 = carve_attack_val(df, seed=123)
+    pd.testing.assert_frame_equal(tune1, tune2)
+    pd.testing.assert_frame_equal(test1, test2)
+
+
+def test_carve_different_seeds_differ():
+    """Different seeds should (overwhelmingly) produce different partitions."""
+    df = _make_carve_df()
+    tune1, _ = carve_attack_val(df, seed=1)
+    tune2, _ = carve_attack_val(df, seed=2)
+    assert not tune1.equals(tune2)
 
 
 # ── PyTorch Dataset ────────────────────────────────────────────────────────────
