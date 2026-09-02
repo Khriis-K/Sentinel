@@ -1,24 +1,16 @@
 # Sentinel
 
-An offline SOC alert triage system that uses an LSTM-VAE (variational autoencoder) to score kernel process events for anomalous (malicious) activity, with LLM-powered incident report generation from detected anomalies. Trains on benign data only; detects anomalies via reconstruction error.
+An offline SOC alert triage system that uses a next-event LSTM (a DeepLog-lineage language model over kernel process events) to score events for anomalous (malicious) activity, with LLM-powered incident report generation from detected anomalies. Trains on benign data only; scores anomalies by per-event surprisal.
 
 ## Language
 
 **Per-event score**:
-An anomaly score assigned to a single kernel process event. Computed by centering a 512-event context window around the target event and running that window through the LSTM-VAE. The reconstruction error (MSE between input and output) serves as the anomaly score. This is the evaluation unit that matches the BETH paper baselines.
-_Avoid_: Window score, segment score, trace score
+The anomaly score for a single kernel process event: the sum of per-field surprisals from the next-event LSTM — −log P(field | trailing context), summed over the predicted fields (eventId, processName, userId, returnValue bucket, argsNum bucket). Higher means the model finds the event more improbable given its past. This is the evaluation unit that matches the BETH paper baselines.
+_Avoid_: Reconstruction error (the retired VAE objective), window score, segment score, trace score
 
-**Centered window**:
-A 512-event window constructed around a target event at position `i`: 256 events before `i`, 255 events after `i`, plus the event at `i` itself. At CSV edges, pad by mirroring or repeating boundary events.
-_Avoid_: Sliding window (that's strided, not centered), context window
-
-**Window-level objective**:
-The current training signal: a window is labeled malicious if it contains at least one `evil==1` event (`label = any(evil)`). This conflates host identification with anomaly detection when val is all-benign and test is all-malicious.
-_Avoid_: Any-evil label, window label
-
-**Per-event objective**:
-The corrected training signal: a centered window is labeled by the center event's `evil` value (`label = evil[i]`). The model learns to answer "is this specific event anomalous?" given its temporal context.
-_Avoid_: Event label (ambiguous — could mean the raw CSV column)
+**Trailing window**:
+The 512 events immediately preceding event `i` (positions `i−512 … i−1`) — the context from which the next-event LSTM predicts event `i`. Events near the start of a host log without a full trailing window are skipped.
+_Avoid_: Centered window (the retired VAE-era construction), sliding window (that's strided, not trailing), context window
 
 **Offline / forensic detection**:
 Sentinel's operational mode: the full event log is available at inference time, and scoring happens retrospectively. An SOC analyst investigating an alert pulls the surrounding event window and classifies. Contrasts with streaming detection, where events arrive one at a time and future context is unavailable.
