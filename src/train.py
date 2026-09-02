@@ -1,42 +1,23 @@
 """
 Sentinel — Training Loop
-LSTM-VAE training with reconstruction loss + KL divergence, early stopping,
-and evaluation against the BETH paper baselines.
+Next-event LSTM training (ADR-0004): summed per-field cross-entropy on
+benign data only, early stopping and model selection on benign-validation
+surprisal, decision threshold tuned on the attack-val carve-out, and
+dense stride-1 per-event evaluation on test.
 """
 import json
-import os
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
-import pandas as pd
 import torch
-import torch.nn as nn
-from sklearn.metrics import (
-    average_precision_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from src.data import (
-    CenteredWindowDataset,
-    load_benchmark_splits,
-    load_per_host_pipeline,
-)
-from src.model import SentinelVAE
-from src.baselines import (
-    BaselineResults,
-    evaluate_baseline,
-    extract_paper_features,
-    train_iforest,
-    train_one_class_svm,
-    train_robust_covariance,
-)
+from src.data import TARGET_FIELDS, load_next_event_pipeline
+from src.eval import evaluate_scores, tune_threshold
+from src.model import NextEventLSTM
 
 
 # ── Device ────────────────────────────────────────────────────────────────────
@@ -50,282 +31,140 @@ def get_device() -> torch.device:
 
 # ── Collation ──────────────────────────────────────────────────────────────────
 
-def collate_fn(batch) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-    """Stack a list of (features, label) tuples into a batch.
+def collate_next_event(batch) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Stack a list of (context, targets) tuples into batched tensors.
 
-    Each feature in features is stacked along dim 0.
-    Labels are stacked and reshaped to (batch_size, 1).
+    Context features stack to (B, window_size, ...); targets stack to (B,).
     """
-    features_list, labels_list = zip(*batch)
+    contexts, targets = zip(*batch)
 
-    batched_features = {}
-    for key in features_list[0]:
-        batched_features[key] = torch.stack([f[key] for f in features_list])
-
-    batched_labels = torch.stack(labels_list).unsqueeze(1)  # (B, 1)
-    return batched_features, batched_labels
+    batched_context = {
+        key: torch.stack([c[key] for c in contexts]) for key in contexts[0]
+    }
+    batched_targets = {
+        field: torch.stack([t[field] for t in targets]) for field in targets[0]
+    }
+    return batched_context, batched_targets
 
 
 # ── Loss ───────────────────────────────────────────────────────────────────────
 
-def vae_loss(
-    reconstructed: torch.Tensor,
-    event_vec: torch.Tensor,
-    mu: torch.Tensor,
-    logvar: torch.Tensor,
-    beta: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute VAE loss = MSE reconstruction + β * KL divergence.
+def next_event_loss(
+    logits: Dict[str, torch.Tensor],
+    targets: Dict[str, torch.Tensor],
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Sum of per-field cross-entropies against the next event's fields.
 
-    Args:
-        reconstructed: Reconstructed event vectors (B, S, event_dim).
-        event_vec: Original event vectors (B, S, event_dim).
-        mu: Latent mean (B, latent_dim).
-        logvar: Latent log-variance (B, latent_dim).
-        beta: Weight for KL divergence term (for annealing).
+    No score-weighting parameters (ADR-0004): every field contributes
+    equally to the loss.
 
     Returns:
-        (total_loss, recon_loss, kl_loss) each as scalar tensors.
+        (total_loss, per_field_losses) — scalar tensor and dict of scalars.
     """
-    # Reconstruction loss (MSE)
-    recon_loss = ((reconstructed - event_vec) ** 2).mean()
-
-    # KL divergence: -0.5 * Σ(1 + log(σ²) - μ² - σ²)
-    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
-    total_loss = recon_loss + beta * kl_loss
-    return total_loss, recon_loss, kl_loss
+    per_field = {
+        field: F.cross_entropy(logits[field], targets[field])
+        for field in TARGET_FIELDS
+    }
+    total = sum(per_field.values())
+    return total, per_field
 
 
 # ── Training ───────────────────────────────────────────────────────────────────
 
 def train_epoch(
-    model: nn.Module,
+    model: NextEventLSTM,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    beta: float = 1.0,
-) -> Tuple[float, float, float]:
-    """Run one training epoch. Returns (total_loss, recon_loss, kl_loss)."""
+) -> Tuple[float, Dict[str, float]]:
+    """Run one training epoch. Returns (avg_total_loss, avg_per_field)."""
     model.train()
     total_loss = 0.0
-    total_recon = 0.0
-    total_kl = 0.0
+    field_sums = {field: 0.0 for field in TARGET_FIELDS}
     n_batches = 0
 
-    for features, _ in loader:
-        # Labels not needed for VAE training (benign only)
-        features = {k: v.to(device) for k, v in features.items()}
+    for context, targets in loader:
+        context = {k: v.to(device, non_blocking=True) for k, v in context.items()}
+        targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
 
         optimizer.zero_grad()
-        reconstructed, mu, logvar = model(features)
-
-        # Compute loss — need event_vec for reconstruction target
-        event_vec, _, _ = model.encode(features)
-        loss, recon, kl = vae_loss(reconstructed, event_vec, mu, logvar, beta=beta)
+        logits = model(context)
+        loss, per_field = next_event_loss(logits, targets)
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
-        total_recon += recon.item()
-        total_kl += kl.item()
+        for field in TARGET_FIELDS:
+            field_sums[field] += per_field[field].item()
         n_batches += 1
 
     if n_batches == 0:
-        return 0.0, 0.0, 0.0
-    return total_loss / n_batches, total_recon / n_batches, total_kl / n_batches
+        return 0.0, {field: 0.0 for field in TARGET_FIELDS}
+    return (
+        total_loss / n_batches,
+        {field: field_sums[field] / n_batches for field in TARGET_FIELDS},
+    )
 
 
 @torch.no_grad()
-def validate_epoch(
-    model: nn.Module,
+def validate_surprisal(
+    model: NextEventLSTM,
     loader: DataLoader,
     device: torch.device,
 ) -> float:
-    """Run one validation epoch. Returns average reconstruction loss."""
+    """Average per-event total surprisal over a benign validation set."""
     model.eval()
-    total_recon = 0.0
-    n_batches = 0
+    surprisal_sum = 0.0
+    n_events = 0
 
-    for features, _ in loader:
-        features = {k: v.to(device) for k, v in features.items()}
+    for context, targets in loader:
+        context = {k: v.to(device, non_blocking=True) for k, v in context.items()}
+        targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
 
-        reconstructed, mu, logvar = model(features)
-        event_vec, _, _ = model.encode(features)
-        recon = ((reconstructed - event_vec) ** 2).mean()
+        surprisal = model.surprisal(context, targets)
+        surprisal_sum += surprisal["total"].sum().item()
+        n_events += surprisal["total"].numel()
 
-        total_recon += recon.item()
-        n_batches += 1
+    return surprisal_sum / n_events if n_events > 0 else 0.0
 
-    return total_recon / n_batches if n_batches > 0 else 0.0
-
-
-# ── Evaluation ─────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def collect_scores(
-    model: nn.Module,
+    model: NextEventLSTM,
     loader: DataLoader,
     device: torch.device,
+    y_true: np.ndarray,
+    centers: list,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Collect reconstruction error scores and labels from a DataLoader.
+    """Per-event total surprisal for every scored position in the loader.
+
+    Args:
+        model: Trained next-event model.
+        loader: DataLoader over a TrailingWindowDataset.
+        device: Torch device.
+        y_true: Evil labels per event (dataset-level, length n_events).
+        centers: The dataset's scored positions (.centers).
 
     Returns:
-        (scores, y_true) as numpy arrays.
+        (scores, labels) — total surprisal and evil label per scored event.
     """
     model.eval()
     all_scores = []
-    all_labels = []
     n_batches = len(loader)
 
-    for i, (features, labels) in enumerate(loader):
-        features = {k: v.to(device) for k, v in features.items()}
+    for i, (context, targets) in enumerate(loader):
+        context = {k: v.to(device, non_blocking=True) for k, v in context.items()}
+        targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
 
-        event_vec, mu, logvar = model.encode(features)
-        z = model.reparameterize(mu, logvar)
-        seq_len = event_vec.size(1)
-        reconstructed = model.decode(z, seq_len)
-
-        mse = ((reconstructed - event_vec) ** 2).mean(dim=(1, 2))
-        all_scores.append(mse.cpu())
-        all_labels.append(labels.squeeze(1).cpu())
+        surprisal = model.surprisal(context, targets)
+        all_scores.append(surprisal["total"].cpu())
 
         if (i + 1) % 500 == 0 or i + 1 == n_batches:
             print(f"    batch {i+1}/{n_batches}", flush=True)
 
     scores = torch.cat(all_scores).numpy()
-    y_true = torch.cat(all_labels).numpy().astype(np.int64)
-    return scores, y_true
-
-
-def find_optimal_threshold(
-    scores: np.ndarray,
-    y_true: np.ndarray,
-) -> Tuple[float, Dict[str, float]]:
-    """Find the threshold that maximizes F1 on the given scores/labels.
-
-    Sweeps 200 candidate thresholds between the 1st and 99th percentile
-    of scores and picks the one with the best F1.
-
-    Returns:
-        (best_threshold, metrics_dict) where metrics_dict has f1, precision,
-        recall at the chosen threshold.
-    """
-    candidates = np.percentile(scores, np.linspace(1, 99, 200))
-    best_f1 = -1.0
-    best_threshold = candidates[0]
-    best_metrics = {}
-
-    for t in candidates:
-        y_pred = (scores >= t).astype(np.int64)
-        f1 = f1_score(y_true, y_pred, zero_division=0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = t
-            best_metrics = {
-                "f1": float(f1),
-                "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-                "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-            }
-
-    return float(best_threshold), best_metrics
-
-
-@torch.no_grad()
-def evaluate_model(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    threshold: Optional[float] = None,
-) -> Dict[str, object]:
-    """Compute all evaluation metrics using reconstruction error as anomaly score.
-
-    Args:
-        model: Trained SentinelVAE.
-        loader: DataLoader to evaluate on.
-        device: Torch device.
-        threshold: Decision threshold. If None, uses median of scores.
-
-    Returns dict with: pr_auc, auroc, f1, precision, recall, confusion_matrix,
-        threshold.
-    """
-    scores, y_true = collect_scores(model, loader, device)
-
-    if len(np.unique(y_true)) < 2:
-        return {
-            "pr_auc": 0.0,
-            "auroc": 0.0,
-            "f1": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "confusion_matrix": [[int((y_true == 0).sum()), 0], [int((y_true == 1).sum()), 0]],
-            "threshold": 0.0,
-        }
-
-    if threshold is None:
-        threshold = float(np.median(scores))
-
-    y_pred = (scores >= threshold).astype(np.int64)
-
-    auroc = float(roc_auc_score(y_true, scores))
-    pr_auc = float(average_precision_score(y_true, scores))
-    f1 = float(f1_score(y_true, y_pred, zero_division=0))
-    precision = float(precision_score(y_true, y_pred, zero_division=0))
-    recall = float(recall_score(y_true, y_pred, zero_division=0))
-    cm = confusion_matrix(y_true, y_pred).tolist()
-
-    return {
-        "pr_auc": pr_auc,
-        "auroc": auroc,
-        "f1": f1,
-        "precision": precision,
-        "recall": recall,
-        "confusion_matrix": cm,
-        "threshold": threshold,
-    }
-
-
-# ── Per-Event Evaluation ──────────────────────────────────────────────────────
-
-def evaluate_per_event(
-    model: nn.Module,
-    features: Dict[str, np.ndarray],
-    labels: np.ndarray,
-    host_lengths: list,
-    device: torch.device,
-    window_size: int = 512,
-    batch_size: int = 256,
-    threshold: Optional[float] = None,
-) -> Dict[str, object]:
-    """Score every valid center event using dense (stride=1) centered windows.
-
-    This is the canonical per-event evaluation that matches the BETH paper
-    baseline protocol: every event with sufficient temporal context on both
-    sides is scored individually, and AUROC / PR-AUC are computed on the
-    resulting per-event score–label pairs.
-
-    Args:
-        model: Trained SentinelVAE.
-        features: Feature dict from ``preprocess_features``.
-        labels: Evil labels (int64 array, same length as features).
-        host_lengths: Event counts per contiguous host segment.
-        device: Torch device.
-        window_size: Events per window (default 512).
-        batch_size: Batch size for inference.
-        threshold: Decision threshold. If None, uses median of scores.
-
-    Returns:
-        Dict with pr_auc, auroc, f1, precision, recall, confusion_matrix,
-        threshold.
-    """
-    ds = CenteredWindowDataset(
-        features, labels, host_lengths,
-        window_size=window_size, stride=1,
-    )
-    loader = DataLoader(
-        ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,
-    )
-    return evaluate_model(model, loader, device, threshold=threshold)
+    labels = np.asarray(y_true)[np.asarray(centers)].astype(np.int64)
+    return scores, labels
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -334,21 +173,24 @@ def main(
     data_dir: str = "data/raw/per_host",
     output_dir: str = "outputs",
     window_size: int = 512,
-    stride: int = 32,
+    train_stride: int = 8,
+    val_stride: int = 16,
     batch_size: int = 64,
     num_epochs: int = 50,
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-5,
     early_stopping_patience: int = 10,
-    kl_warmup_epochs: int = 10,
+    n_blocks: int = 50,
+    tune_frac: float = 0.2,
     seed: int = 42,
+    evaluate: bool = True,
 ):
-    """Run the full LSTM-VAE training pipeline with per-event centered windows.
+    """Run the next-event training pipeline.
 
-    Loads per-host CSVs, trains on benign data only with reconstruction +
-    KL divergence loss, evaluates with per-event scoring against the test
-    split, runs paper baselines for comparison, and writes model.pt +
-    eval_results.json.
+    Loads per-host CSVs (benign hosts train/val, attack-val carved from
+    test), trains the next-event LSTM on summed per-field cross-entropy,
+    and saves model.pt. When ``evaluate``, tunes the decision threshold on
+    attack-val and evaluates dense stride-1 on test.
     """
     # ── Setup ───────────────────────────────────────────────────────────────
     torch.manual_seed(seed)
@@ -357,272 +199,190 @@ def main(
     device = get_device()
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    pin_memory = device.type == "cuda"
 
     print(f"Device: {device}")
     print(f"Output dir: {output_path.resolve()}")
 
     # ── Load data (benign only for training) ─────────────────────────────────
     print(f"\nLoading per-host CSVs from {data_dir}...")
-    (
-        train_ds, val_ds, test_ds, mixed_val_ds,
-        process_vocab, args_vocab, cat_vocabs, numeric_stats, vocab_sizes,
-    ) = load_per_host_pipeline(
+    train_ds, val_ds, tune_ds, test_ds, vocab_sizes, vocabs = load_next_event_pipeline(
         raw_dir=data_dir,
         window_size=window_size,
-        stride=stride,
-        train_attack_frac=0,  # No attack data in training — unsupervised
+        train_stride=train_stride,
+        val_stride=val_stride,
+        n_blocks=n_blocks,
+        tune_frac=tune_frac,
         seed=seed,
     )
-    print(f"  Train:     {len(train_ds)} windows (benign only)")
-    print(f"  Val:       {len(val_ds)} windows (all-benign)")
-    if mixed_val_ds is not None:
-        n_mixed_pos = int(sum(1 for i in range(len(mixed_val_ds)) if mixed_val_ds[i][1].item() == 1))
-        print(f"  Mixed Val: {len(mixed_val_ds)} windows ({n_mixed_pos} evil-center)")
-    print(f"  Test:      {len(test_ds)} windows")
+
+    def _describe(name: str, ds) -> None:
+        n_evil = int(ds.labels[ds.centers].sum()) if ds.labels is not None and len(ds) else 0
+        print(f"  {name:10s} {len(ds):>9,} scored events ({n_evil:,} evil)")
+
+    print("\nSplits (scored target events):")
+    _describe("Train", train_ds)
+    _describe("Val", val_ds)
+    _describe("AttackVal", tune_ds)
+    _describe("Test", test_ds)
 
     # ── DataLoaders ─────────────────────────────────────────────────────────
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
+        train_ds, batch_size=batch_size, shuffle=True,
+        collate_fn=collate_next_event, pin_memory=pin_memory,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,
+        val_ds, batch_size=batch_size, shuffle=False,
+        collate_fn=collate_next_event, pin_memory=pin_memory,
     )
-    mixed_val_loader = None
-    if mixed_val_ds is not None and len(mixed_val_ds) > 0:
-        # Use stride=1 for mixed-val AUROC monitoring
-        mixed_val_dense = CenteredWindowDataset(
-            mixed_val_ds.features, mixed_val_ds.labels, mixed_val_ds.host_lengths,
-            window_size=window_size, stride=1,
-        )
-        mixed_val_loader = DataLoader(
-            mixed_val_dense, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,
-        )
+    tune_loader = DataLoader(
+        tune_ds, batch_size=batch_size, shuffle=False,
+        collate_fn=collate_next_event, pin_memory=pin_memory,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False,
+        collate_fn=collate_next_event, pin_memory=pin_memory,
+    )
 
     # ── Model ───────────────────────────────────────────────────────────────
-    model_kwargs = {
-        "process_name_vocab_size": vocab_sizes["processName"],
-        "args_vocab_size": vocab_sizes["args"],
-        "user_id_vocab_size": vocab_sizes["userId"],
-        "mount_ns_vocab_size": vocab_sizes["mountNamespace"],
-        "event_id_vocab_size": vocab_sizes["eventId"],
-    }
-    model = SentinelVAE(**model_kwargs).to(device)
+    model = NextEventLSTM(**vocab_sizes).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel: {n_params:,} trainable parameters")
 
-    # ── Optimizer ───────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay,
     )
 
     # ── Training loop ───────────────────────────────────────────────────────
-    best_val_loss = float("inf")
-    best_mixed_auroc = 0.0
+    best_val_surprisal = float("inf")
     best_epoch = 0
     best_state = None
     patience_counter = 0
 
-    print(f"\nTraining ({num_epochs} epochs max, patience={early_stopping_patience}, "
-          f"KL warmup={kl_warmup_epochs}):")
+    print(f"\nTraining ({num_epochs} epochs max, patience={early_stopping_patience}):")
     t_start = time.time()
 
     for epoch in range(1, num_epochs + 1):
-        # KL annealing: linear warmup from 0 to 1 over kl_warmup_epochs
-        beta = min(1.0, epoch / max(kl_warmup_epochs, 1))
+        train_loss, per_field = train_epoch(model, train_loader, optimizer, device)
+        val_surprisal = validate_surprisal(model, val_loader, device)
 
-        train_loss, train_recon, train_kl = train_epoch(
-            model, train_loader, optimizer, device, beta=beta,
-        )
-        val_recon = validate_epoch(model, val_loader, device)
-
-        # Early stopping: all-benign val reconstruction loss
-        loss_improved = val_recon < best_val_loss
-        if loss_improved:
-            best_val_loss = val_recon
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        # Model selection: mixed-class val AUROC (fallback: val loss)
-        mixed_auroc_str = ""
-        if mixed_val_loader is not None and len(mixed_val_ds) > 0:
-            mixed_metrics = evaluate_model(model, mixed_val_loader, device)
-            mixed_auroc = mixed_metrics["auroc"]
-            if mixed_auroc > best_mixed_auroc:
-                best_mixed_auroc = mixed_auroc
-                best_epoch = epoch
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            mixed_auroc_str = f" | mixed_auroc: {mixed_auroc:.4f}"
-        elif loss_improved:
+        if val_surprisal < best_val_surprisal:
+            best_val_surprisal = val_surprisal
             best_epoch = epoch
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+            marker = " *"
+        else:
+            patience_counter += 1
+            marker = ""
 
-        marker = " *" if (mixed_val_loader is not None and mixed_auroc > 0 and mixed_auroc >= best_mixed_auroc) or (mixed_val_loader is None and loss_improved) else ""
+        field_str = " ".join(f"{f[:4]}={per_field[f]:.3f}" for f in TARGET_FIELDS)
         print(
             f"  Epoch {epoch:3d}/{num_epochs} | "
-            f"loss: {train_loss:.4f} (recon: {train_recon:.4f}, kl: {train_kl:.4f}) | "
-            f"val_recon: {val_recon:.4f} | beta={beta:.2f}"
-            f"{mixed_auroc_str}{marker}"
+            f"loss: {train_loss:.4f} ({field_str}) | "
+            f"val_surprisal: {val_surprisal:.4f}{marker}",
+            flush=True,
         )
 
         if patience_counter >= early_stopping_patience:
-            print(f"  Early stopping at epoch {epoch} (val_recon no improvement for {patience_counter} epochs)")
+            print(f"  Early stopping at epoch {epoch} "
+                  f"(no val-surprisal improvement for {patience_counter} epochs)")
             break
 
     train_time = time.time() - t_start
-    print(f"\nBest val_recon: {best_val_loss:.4f} at epoch {best_epoch}")
-    if mixed_val_loader is not None:
-        print(f"Best mixed-val AUROC: {best_mixed_auroc:.4f}")
+    print(f"\nBest val surprisal: {best_val_surprisal:.4f} at epoch {best_epoch}")
     print(f"Training time: {train_time:.0f}s")
 
-    # ── Load best model ─────────────────────────────────────────────────────
+    # ── Save checkpoint (before evaluation — a crash keeps the model) ────────
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # ── Threshold tuning on mixed-val set ───────────────────────────────────
-    optimal_threshold = None
-    if mixed_val_loader is not None and len(mixed_val_ds) > 0:
-        print("\nTuning threshold on mixed-val set...")
-        val_scores, val_labels = collect_scores(model, mixed_val_loader, device)
-        optimal_threshold, val_threshold_metrics = find_optimal_threshold(
-            val_scores, val_labels,
-        )
-        print(f"  Optimal threshold: {optimal_threshold:.6f}")
-        print(f"  Mixed-val @ threshold: "
-              f"F1={val_threshold_metrics['f1']:.4f}, "
-              f"Precision={val_threshold_metrics['precision']:.4f}, "
-              f"Recall={val_threshold_metrics['recall']:.4f}")
-
-    # ── Per-event evaluation on test split ──────────────────────────────────
-    print("\nPer-event evaluation on test split (stride=1, every center event)...")
-    test_labels = test_ds.labels
-    test_host_lengths = test_ds.host_lengths
-    bilstm_metrics = evaluate_per_event(
-        model, test_ds.features, test_labels, test_host_lengths,
-        device, window_size=window_size, batch_size=batch_size * 4,
-        threshold=optimal_threshold,
-    )
-
-    print(f"  PR-AUC:     {bilstm_metrics['pr_auc']:.4f}  (primary)")
-    print(f"  AUROC:      {bilstm_metrics['auroc']:.4f}")
-    print(f"  F1:         {bilstm_metrics['f1']:.4f}")
-    print(f"  Precision:  {bilstm_metrics['precision']:.4f}")
-    print(f"  Recall:     {bilstm_metrics['recall']:.4f}")
-    print(f"  Threshold:  {bilstm_metrics.get('threshold', 'N/A')}")
-    print(f"  Confusion:  {bilstm_metrics['confusion_matrix']}")
-
-    # ── Run paper baselines on per-host test data ───────────────────────────
-    print("\nRunning paper baselines on per-host test data...")
-
-    # Reconstruct per-host data for sklearn baselines
-    import src.data as data_module
-    host_dfs = data_module.load_beth_data(data_dir)
-    sorted_parts = []
-    for host in sorted(host_dfs):
-        df = host_dfs[host]
-        if "timestamp" in df.columns:
-            df = df.sort_values("timestamp")
-        sorted_parts.append(df)
-    full_df_bl = pd.concat(sorted_parts, ignore_index=True)
-    train_df_bl, _, test_df_bl = data_module.split_by_host(full_df_bl, seed=seed)
-
-    rng_bl = np.random.default_rng(seed)
-    n_bl_train = min(10000, len(train_df_bl))
-    train_sample = train_df_bl.iloc[rng_bl.choice(len(train_df_bl), n_bl_train, replace=False)]
-
-    X_train_paper = extract_paper_features(train_sample)
-    X_test_paper = extract_paper_features(test_df_bl)
-    y_test_paper = test_df_bl["evil"].values.astype(np.int64)
-
-    baseline_results = BaselineResults()
-
-    # iForest
-    iforest = train_iforest(X_train_paper, seed=seed)
-    baseline_results.iforest = evaluate_baseline(iforest, X_test_paper, y_test_paper)
-
-    # Robust Covariance
-    try:
-        robust = train_robust_covariance(X_train_paper, seed=seed)
-        baseline_results.robust_covariance = evaluate_baseline(robust, X_test_paper, y_test_paper)
-    except Exception as e:
-        print(f"  Robust Covariance skipped: {e}")
-
-    # One-Class SVM
-    try:
-        n_svm = min(3000, n_bl_train)
-        X_svm = X_train_paper[:n_svm]
-        ocsvm = train_one_class_svm(X_svm)
-        baseline_results.one_class_svm = evaluate_baseline(ocsvm, X_test_paper, y_test_paper)
-    except Exception as e:
-        print(f"  One-Class SVM skipped: {e}")
-
-    for name, metrics in [
-        ("iForest", baseline_results.iforest),
-        ("Robust Covariance", baseline_results.robust_covariance),
-        ("One-Class SVM", baseline_results.one_class_svm),
-    ]:
-        if metrics is not None:
-            print(f"  {name:20s}: AUROC={metrics['auroc']:.4f}, PR-AUC={metrics['pr_auc']:.4f}")
-
-    # ── Build comparison table ──────────────────────────────────────────────
-    comparison = baseline_results.to_dataframe()
-    vae_row = pd.DataFrame([{
-        "model": "LSTM-VAE (Sentinel)",
-        "auroc": bilstm_metrics["auroc"],
-        "pr_auc": bilstm_metrics["pr_auc"],
-        "f1": bilstm_metrics["f1"],
-        "precision": bilstm_metrics["precision"],
-        "recall": bilstm_metrics["recall"],
-    }])
-    comparison = pd.concat([vae_row, comparison], ignore_index=True)
-
-    print(f"\n{'='*70}")
-    print("Comparison: LSTM-VAE vs. Paper Baselines")
-    print(f"{'='*70}")
-    print(comparison.to_string(index=False))
-
-    # ── Save artifacts ──────────────────────────────────────────────────────
     model_path = output_path / "model.pt"
     torch.save(
         {
             "model_state_dict": best_state if best_state is not None else model.state_dict(),
             "init_kwargs": model._init_kwargs,
             "vocab_sizes": vocab_sizes,
-            "preprocess_artifacts": {
-                "process_vocab": process_vocab,
-                "args_vocab": args_vocab,
-                "cat_vocabs": cat_vocabs,
-                "numeric_stats": numeric_stats,
-            },
+            "vocabs": vocabs,
         },
         model_path,
     )
     print(f"\nSaved model -> {model_path}")
 
-    # Save eval results
     eval_results = {
-        "vae": bilstm_metrics,
-        "baselines": {
-            "iforest": baseline_results.iforest,
-            "robust_covariance": baseline_results.robust_covariance,
-            "one_class_svm": baseline_results.one_class_svm,
-        },
-        "comparison": comparison.to_dict(orient="records"),
+        "next_event_lstm": None,
+        "threshold_tuning": None,
+        "baselines": None,
         "config": {
+            "data_dir": data_dir,
             "window_size": window_size,
-            "stride": stride,
+            "train_stride": train_stride,
+            "val_stride": val_stride,
             "batch_size": batch_size,
             "num_epochs": num_epochs,
             "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "early_stopping_patience": early_stopping_patience,
             "best_epoch": best_epoch,
-            "best_val_loss": best_val_loss,
-            "best_mixed_auroc": best_mixed_auroc if mixed_val_loader is not None else None,
-            "kl_warmup_epochs": kl_warmup_epochs,
+            "best_val_surprisal": best_val_surprisal,
             "train_time_s": train_time,
+            "n_blocks": n_blocks,
+            "tune_frac": tune_frac,
             "vocab_sizes": vocab_sizes,
+            "seed": seed,
             "device": str(device),
+            "n_params": n_params,
+            "dataset_sizes": {
+                "train": len(train_ds),
+                "val": len(val_ds),
+                "attack_val": len(tune_ds),
+                "test": len(test_ds),
+            },
         },
     }
+
+    # ── Threshold tuning on attack-val + dense test evaluation ───────────────
+    if evaluate:
+        print("\nScoring attack-val (threshold tuning set)...")
+        tune_scores, tune_labels = collect_scores(
+            model, tune_loader, device, tune_ds.labels, tune_ds.centers,
+        )
+        print(f"  {len(tune_scores):,} events, {int(tune_labels.sum()):,} evil")
+
+        print("\nTuning threshold on attack-val (full score range)...")
+        threshold, tune_metrics = tune_threshold(tune_scores, tune_labels)
+        print(f"  Threshold: {threshold:.6f}")
+        print(f"  Attack-val @ threshold: "
+              f"F1={tune_metrics['f1']:.4f}, "
+              f"P={tune_metrics['precision']:.4f}, "
+              f"R={tune_metrics['recall']:.4f}")
+
+        print("\nScoring test (dense stride-1, every target event)...")
+        test_scores, test_labels = collect_scores(
+            model, test_loader, device, test_ds.labels, test_ds.centers,
+        )
+        print(f"  {len(test_scores):,} events, {int(test_labels.sum()):,} evil")
+
+        metrics = evaluate_scores(test_labels, test_scores, threshold)
+        print(f"\nTest @ attack-val threshold:")
+        print(f"  AUROC:            {metrics['auroc']:.4f}")
+        print(f"  PR-AUC:           {metrics['pr_auc']:.4f}  (primary)")
+        print(f"  F1:               {metrics['f1']:.4f}")
+        print(f"  Precision@0.1%:   {metrics['precision_at_0_1']:.4f}")
+        print(f"  Precision@1%:     {metrics['precision_at_1']:.4f}")
+        print(f"  Confusion:        {metrics['confusion_matrix']}")
+
+        eval_results["next_event_lstm"] = metrics
+        eval_results["threshold_tuning"] = {
+            "threshold": threshold,
+            "tune_source": "attack-val (carved from test; test never used for tuning)",
+            "tune_size": int(len(tune_scores)),
+            "tune_evil": int(tune_labels.sum()),
+            "tune_metrics": tune_metrics,
+            "method": "maximize F1 over 1000 candidates spanning the full score range",
+        }
+
+    # ── Save eval results ────────────────────────────────────────────────────
     eval_path = output_path / "eval_results.json"
     with open(eval_path, "w") as f:
         json.dump(eval_results, f, indent=2, default=_json_serialize)
