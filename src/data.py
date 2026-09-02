@@ -1,7 +1,8 @@
 """
 Sentinel — Data Pipeline
-BETH dataset loading, host-based splitting, text tokenization,
-feature preprocessing, and PyTorch Dataset for sliding windows.
+BETH dataset loading, host-based splitting, categorical vocabularies,
+deterministic bucketizers, trailing-window next-event datasets, the
+attack-val carve-out, and the end-to-end pipeline (ADR-0004).
 """
 import re
 import warnings
@@ -23,23 +24,19 @@ BETH_COLUMNS = [
     "stackAddresses", "args",
 ]
 
-NUMERIC_FEATURES = ["argsNum", "returnValue", "parentProcessId"]
 METRIC_KEYS = ["auroc", "pr_auc", "f1", "precision", "recall"]
 
 
 # ── Loading ────────────────────────────────────────────────────────────────────
 
 def load_beth_data(raw_dir: str) -> Dict[str, pd.DataFrame]:
-    """Load all CSV files from a directory, keyed by hostname.
-
-    Each CSV is named <hostname>.csv as in the BETH dataset convention.
-    Returns a dict mapping hostname → DataFrame.
+    """Load all CSV files from a directory, keyed by filename stem.
 
     Args:
         raw_dir: Path to directory containing BETH CSV files.
 
     Returns:
-        Dict of hostname → DataFrame for each CSV found.
+        Dict of filename stem → DataFrame for each CSV found.
     """
     raw_path = Path(raw_dir)
     if not raw_path.is_dir():
@@ -171,6 +168,50 @@ def map_categorical(series: pd.Series, vocab: Dict[int, int]) -> np.ndarray:
     """
     return np.array(
         [vocab.get(int(v), 0) for v in series.fillna(0)],
+        dtype=np.int64,
+    )
+
+
+def build_process_name_vocab(series: pd.Series, max_size: int = 50000) -> Dict[str, int]:
+    """Build an exact-string value→index mapping for processName.
+
+    Index 0 is reserved for OOV (unseen names). Names are assigned indices
+    1..n in descending frequency order, ties broken alphabetically so the
+    mapping is deterministic.
+
+    Args:
+        series: Raw processName strings.
+        max_size: Maximum number of unique names to keep (most frequent).
+
+    Returns:
+        Dict mapping processName string → index (indices start at 1).
+    """
+    counts = series.fillna("").astype(str).value_counts()
+    ordered = sorted(counts.items(), key=lambda nc: (-nc[1], nc[0]))
+
+    vocab: Dict[str, int] = {}
+    for name, _ in ordered:
+        if len(vocab) >= max_size:
+            break
+        vocab[name] = len(vocab) + 1  # 0 reserved for OOV
+
+    return vocab
+
+
+def map_process_name(series: pd.Series, vocab: Dict[str, int]) -> np.ndarray:
+    """Map processName strings through the exact-string vocabulary.
+
+    Names not in the vocab map to the reserved OOV index 0.
+
+    Args:
+        series: Raw processName strings.
+        vocab: Name → index mapping from build_process_name_vocab.
+
+    Returns:
+        int64 numpy array of mapped indices.
+    """
+    return np.array(
+        [vocab.get(str(v), 0) for v in series.fillna("")],
         dtype=np.int64,
     )
 
@@ -401,104 +442,66 @@ def preprocess_features(
     df: pd.DataFrame,
     process_name_vocab: Optional[Dict[str, int]] = None,
     args_vocab: Optional[Dict[str, int]] = None,
-    max_args_len: int = 64,
-    max_process_name_len: int = 16,
-    numeric_stats: Optional[Dict[str, Tuple[float, float]]] = None,
     cat_vocabs: Optional[Dict[str, Dict[int, int]]] = None,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, Tuple[float, float]]]:
-    """Convert a raw BETH DataFrame into numeric feature arrays.
+    max_args_len: int = 64,
+) -> Dict[str, np.ndarray]:
+    """Convert a raw BETH DataFrame into categorical index feature arrays.
 
-    Returns feature dict and numeric_stats dict (mean, std per numeric feature).
-    If numeric_stats is provided, use those for standardization instead of
-    computing from df — this ensures val/test use train's statistics.
+    Every feature becomes an int64 class index — embeddings consume them
+    directly, and the predicted fields double as cross-entropy targets.
+    Bucketing is deterministic (not fitted), and vocabularies are built
+    from training data only, so all splits share one schema by construction.
 
     Features:
-      - processName_ids: token indices (n_events, max_process_name_len)
-      - args_ids: token indices (n_events, max_args_len)
-      - userId: integer array
-      - mountNamespace: integer array
-      - eventId: integer array
-      - argsNum: float32 (standardized)
-      - returnValue: float32 (standardized)
-      - parentProcessId: float32 (3-level → standardized)
+      - processName: exact-name class index (0 = OOV)
+      - args_ids: token indices (n_events, max_args_len), 0 = <PAD>
+      - userId: categorical index (0 = OOV)
+      - eventId: categorical index (0 = OOV)
+      - argsNum: bucket class in [0, 15]
+      - returnValue: bucket class in [0, 12]
+      - parentProcessId: 3-level index (0, 1, other)
 
     Args:
         df: Raw BETH DataFrame.
-        process_name_vocab: Vocab for processName. Built from data if None.
-        args_vocab: Vocab for args. Built from data if None.
+        process_name_vocab: Exact-name vocab. Built from df if None.
+        args_vocab: Token vocab. Built from df if None.
+        cat_vocabs: Dict of feature_name → {value: index} for userId and
+            eventId. When None, all values map to OOV.
         max_args_len: Max token length for args.
-        max_process_name_len: Max token length for processName.
-        numeric_stats: Optional dict of feature_name → (mean, std) for
-            standardization. If None, stats are computed from df.
-        cat_vocabs: Optional dict of feature_name → {value: index} for
-            categorical features (userId, mountNamespace, eventId).
-            When provided, raw values are mapped to contiguous indices.
-            When None, raw integer values are used as-is.
 
     Returns:
-        (features_dict, numeric_stats_dict)
+        features_dict of int64 numpy arrays.
     """
-    # Build vocabs if not provided
     if process_name_vocab is None:
-        process_name_vocab = build_vocab(df["processName"], max_tokens=5000)
+        process_name_vocab = build_process_name_vocab(df["processName"])
     if args_vocab is None:
         args_vocab = build_vocab(df["args"], max_tokens=10000)
 
-    # Tokenize text features
-    process_name_ids = tokenize_texts(
-        df["processName"], process_name_vocab, max_len=max_process_name_len
-    )
-    args_ids = tokenize_texts(
-        df["args"], args_vocab, max_len=max_args_len
-    )
+    args_ids = tokenize_texts(df["args"], args_vocab, max_len=max_args_len)
 
-    # Categorical features — map to contiguous indices if vocabs provided
     cat_vocabs = cat_vocabs or {}
     user_id = map_categorical(df["userId"], cat_vocabs.get("userId", {})) \
-        if "userId" in cat_vocabs and "userId" in df.columns \
-        else np.zeros(len(df), dtype=np.int64)
-    mount_ns = map_categorical(df["mountNamespace"], cat_vocabs.get("mountNamespace", {})) \
-        if "mountNamespace" in cat_vocabs and "mountNamespace" in df.columns \
-        else np.zeros(len(df), dtype=np.int64)
+        if "userId" in df.columns else np.zeros(len(df), dtype=np.int64)
     event_id = map_categorical(df["eventId"], cat_vocabs.get("eventId", {})) \
-        if "eventId" in cat_vocabs and "eventId" in df.columns \
-        else np.zeros(len(df), dtype=np.int64)
+        if "eventId" in df.columns else np.zeros(len(df), dtype=np.int64)
 
-    # Numeric features — 3-level parentProcessId + argsNum + returnValue
-    parent_pid = df["parentProcessId"].fillna(0).astype(np.float64).values
-    parent_pid_cat = np.where(parent_pid == 0, 0.0,
-                      np.where(parent_pid == 1, 1.0, 2.0))
+    # parentProcessId: closed 3-level transform — real value 0 (no parent),
+    # 1, and everything else. Not an OOV scheme; all three are real classes.
+    parent_pid = df["parentProcessId"].fillna(0).astype(np.int64).values
+    parent_pid_cat = np.where(parent_pid == 0, 0,
+                       np.where(parent_pid == 1, 1, 2)).astype(np.int64)
 
-    raw_numeric = {
-        "argsNum": df["argsNum"].fillna(0).astype(np.float64).values,
-        "returnValue": df["returnValue"].fillna(0).astype(np.float64).values,
+    features = {
+        "processName": map_process_name(df["processName"], process_name_vocab),
+        "args_ids": np.array(args_ids, dtype=np.int64),
+        "userId": user_id,
+        "eventId": event_id,
+        "argsNum": bucket_args_num(df["argsNum"]),
+        "returnValue": bucket_return_value(df["returnValue"]),
         "parentProcessId": parent_pid_cat,
     }
 
-    # Standardize: use provided stats or compute from this df
-    computed_stats = {}
-    standardized = {}
-    for name in NUMERIC_FEATURES:
-        if numeric_stats is not None and name in numeric_stats:
-            mean, std = numeric_stats[name]
-        else:
-            mean = float(raw_numeric[name].mean())
-            std = float(raw_numeric[name].std())
-        computed_stats[name] = (mean, std)
-        standardized[name] = ((raw_numeric[name] - mean) / (std + 1e-8)).astype(np.float32)
-
-    features = {
-        "processName_ids": np.array(process_name_ids, dtype=np.int64),
-        "args_ids": np.array(args_ids, dtype=np.int64),
-        "userId": user_id,
-        "mountNamespace": mount_ns,
-        "eventId": event_id,
-        "argsNum": standardized["argsNum"],
-        "returnValue": standardized["returnValue"],
-        "parentProcessId": standardized["parentProcessId"],
-    }
-
-    return features, computed_stats
+    return features
 
 
 # ── Next-Event Targets ─────────────────────────────────────────────────────────
@@ -522,6 +525,9 @@ class TrailingWindowDataset(Dataset):
 
     ``stride`` subsamples target positions (dense stride=1 for evaluation).
 
+    Labels, when provided, are stored (not yielded) so evaluation code can
+    look up ``labels[center]`` for the scored events.
+
     Yields (context, targets) tuples where:
       - context is a dict of int64 tensors, each with ``window_size`` in dim 0
       - targets is a dict of scalar int64 tensors, one per TARGET_FIELDS entry
@@ -533,11 +539,13 @@ class TrailingWindowDataset(Dataset):
         host_lengths: List[int],
         window_size: int = 512,
         stride: int = 1,
+        labels: Optional[np.ndarray] = None,
     ):
         self.features = features
         self.host_lengths = host_lengths
         self.window_size = window_size
         self.stride = stride
+        self.labels = labels
 
         # A position is a valid target if it has a full window of preceding
         # events within the same host: first target of a host is at
@@ -569,303 +577,12 @@ class TrailingWindowDataset(Dataset):
         return context, targets
 
 
-# ── PyTorch Dataset ────────────────────────────────────────────────────────────
-
-class BethDataset(Dataset):
-    """Sliding-window dataset over BETH feature arrays.
-
-    Yields (features, label) tuples where:
-      - features is a dict of torch tensors, each of shape (window_size, ...)
-      - label is 0 (benign) or 1 (malicious)
-
-    A window is labeled malicious if it contains at least one evil==1 event.
-    """
-
-    def __init__(
-        self,
-        features: Dict[str, np.ndarray],
-        labels: np.ndarray,
-        window_size: int = 512,
-        stride: int = 256,
-    ):
-        self.features = features
-        self.labels = labels
-        self.window_size = window_size
-        self.stride = stride
-
-        n_events = len(labels)
-        if n_events < window_size:
-            self.n_windows = 0
-        else:
-            self.n_windows = (n_events - window_size) // stride + 1
-
-    def __len__(self) -> int:
-        return self.n_windows
-
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        start = idx * self.stride
-        end = start + self.window_size
-
-        x = {}
-        for key, arr in self.features.items():
-            window = arr[start:end].copy()
-            x[key] = torch.from_numpy(window)
-
-        window_labels = self.labels[start:end]
-        label = 1 if np.any(window_labels == 1) else 0
-
-        return x, torch.tensor(label, dtype=torch.float32)
-
-
-# ── Centered-Window Dataset ────────────────────────────────────────────────────
-
-class CenteredWindowDataset(Dataset):
-    """Per-event dataset using centered windows for training and evaluation.
-
-    Each window is a 512-event slice centered on a specific event at position i
-    (256 before, 255 after, plus the event itself). The label is ``evil[i]`` —
-    the center event's value — not ``any(evil_in_window)``.
-
-    Host boundaries are respected: windows never span across different hosts.
-    Edge handling is truncate — events without 256 neighbors on both sides
-    within their host are not used as centers.
-
-    Yields (features, label) tuples where:
-      - features is a dict of torch tensors, each of shape (window_size, ...)
-      - label is 0 (benign center) or 1 (malicious center)
-    """
-
-    def __init__(
-        self,
-        features: Dict[str, np.ndarray],
-        labels: np.ndarray,
-        host_lengths: List[int],
-        window_size: int = 512,
-        stride: int = 32,
-    ):
-        self.features = features
-        self.labels = labels
-        self.host_lengths = host_lengths
-        self.window_size = window_size
-        self.stride = stride
-        self.half = window_size // 2
-
-        # Build the list of global indices that are valid center positions.
-        # A position is valid if it has `half` events before and after it
-        # within the same host.
-        self.centers: List[int] = []
-        offset = 0
-        for host_n in host_lengths:
-            if host_n >= window_size:
-                first_center = offset + self.half
-                last_center = offset + host_n - self.half
-                # range stop is exclusive, so we go up to last_center inclusive
-                for center in range(first_center, last_center, stride):
-                    self.centers.append(center)
-            offset += host_n
-
-    def __len__(self) -> int:
-        return len(self.centers)
-
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        center = self.centers[idx]
-        start = center - self.half
-        end = center + self.half
-
-        x = {}
-        for key, arr in self.features.items():
-            window = arr[start:end].copy()
-            x[key] = torch.from_numpy(window)
-
-        label = self.labels[center]
-        return x, torch.tensor(label, dtype=torch.float32)
-
-
 # ── Utility ────────────────────────────────────────────────────────────────────
-
-def load_and_prepare(
-    raw_dir: str,
-    window_size: int = 512,
-    stride: int = 256,
-    seed: int = 42,
-) -> Tuple[BethDataset, BethDataset, BethDataset, Dict, Dict]:
-    """End-to-end pipeline: load BETH data, split by host, preprocess, create datasets.
-
-    Events are sorted by timestamp within each host before windowing,
-    ensuring windows represent contiguous event sequences.
-
-    Returns:
-        (train_ds, val_ds, test_ds, process_name_vocab, args_vocab)
-    """
-    host_dfs = load_beth_data(raw_dir)
-    if not host_dfs:
-        raise FileNotFoundError(f"No CSV files found in {raw_dir}")
-
-    # Sort each host's events by timestamp, then combine
-    sorted_dfs = []
-    for host, df in host_dfs.items():
-        if "timestamp" in df.columns:
-            df = df.sort_values("timestamp")
-        sorted_dfs.append(df)
-
-    full_df = pd.concat(sorted_dfs, ignore_index=True)
-
-    # Split by host
-    train_df, val_df, test_df = split_by_host(full_df, seed=seed)
-
-    # Build vocabs from training data only
-    process_vocab = build_vocab(train_df["processName"], max_tokens=5000)
-    args_vocab = build_vocab(train_df["args"], max_tokens=10000)
-
-    # Preprocess — fit on train, transform val/test with train stats
-    train_feat, numeric_stats = preprocess_features(
-        train_df, process_vocab, args_vocab,
-    )
-    val_feat, _ = preprocess_features(
-        val_df, process_vocab, args_vocab, numeric_stats=numeric_stats,
-    )
-    test_feat, _ = preprocess_features(
-        test_df, process_vocab, args_vocab, numeric_stats=numeric_stats,
-    )
-
-    # Create datasets
-    train_ds = BethDataset(
-        train_feat, _get_labels(train_df),
-        window_size=window_size, stride=stride,
-    )
-    val_ds = BethDataset(
-        val_feat, _get_labels(val_df),
-        window_size=window_size, stride=stride,
-    )
-    test_ds = BethDataset(
-        test_feat, _get_labels(test_df),
-        window_size=window_size, stride=stride,
-    )
-
-    return train_ds, val_ds, test_ds, process_vocab, args_vocab
-
-
-# ── Benchmark Split Loader ────────────────────────────────────────────────────
-
-def load_benchmark_splits(
-    data_dir: str,
-    window_size: int = 512,
-    stride: int = 256,
-    train_attack_frac: float = 0.2,
-    seed: int = 42,
-) -> Tuple[BethDataset, BethDataset, BethDataset, Dict, Dict, Dict[str, int]]:
-    """Load the 3 pre-split BETH benchmark CSV files and create PyTorch Datasets.
-
-    The BETH benchmark splits are designed for unsupervised anomaly detection:
-    training contains only benign hosts, the test host contains the attack.
-    For supervised BiLSTM training, a fraction of the test host's events are
-    mixed into the training set so the model sees positive examples.
-
-    Args:
-        data_dir: Directory containing labelled_{training,validation,testing}_data.csv.
-        window_size: Events per sliding window.
-        stride: Stride between windows.
-        train_attack_frac: Fraction of the test host's events to mix into training
-            for supervised learning (default 0.2 = 20%).
-        seed: Random seed for attack-data split.
-
-    Returns:
-        (train_ds, val_ds, test_ds, process_vocab, args_vocab, vocab_sizes)
-        where vocab_sizes maps embedding key → vocabulary size.
-    """
-    import os
-
-    train_path = os.path.join(data_dir, "labelled_training_data.csv")
-    val_path = os.path.join(data_dir, "labelled_validation_data.csv")
-    test_path = os.path.join(data_dir, "labelled_testing_data.csv")
-
-    for p in [train_path, val_path, test_path]:
-        if not os.path.isfile(p):
-            raise FileNotFoundError(f"Benchmark file not found: {p}")
-
-    train_df = pd.read_csv(train_path)
-    val_df = pd.read_csv(val_path)
-    test_df = pd.read_csv(test_path)
-
-    # Sort by timestamp within each split
-    for df in [train_df, val_df, test_df]:
-        if "timestamp" in df.columns:
-            df.sort_values("timestamp", inplace=True)
-
-    # Mix attack data into training for supervised learning.
-    # The test host contains the only evil==1 events.
-    if train_attack_frac > 0 and "evil" in test_df.columns:
-        rng = np.random.default_rng(seed)
-        test_hosts = test_df["hostName"].unique()
-        n_test = len(test_df)
-        n_mix = int(n_test * train_attack_frac)
-
-        # Shuffle indices and split
-        indices = rng.permutation(n_test)
-        mix_idx = indices[:n_mix]
-        keep_idx = indices[n_mix:]
-
-        mix_df = test_df.iloc[mix_idx].copy()
-        test_df = test_df.iloc[keep_idx].copy()
-
-        train_df = pd.concat([train_df, mix_df], ignore_index=True)
-        # Re-sort training by timestamp
-        train_df.sort_values("timestamp", inplace=True)
-
-    # Build vocabs from training data only
-    process_vocab = build_vocab(train_df["processName"], max_tokens=5000)
-    args_vocab = build_vocab(train_df["args"], max_tokens=10000)
-
-    # Build categorical vocabs for high-cardinality integer features
-    cat_vocabs = {
-        "userId": build_categorical_vocab(train_df["userId"]),
-        "mountNamespace": build_categorical_vocab(train_df["mountNamespace"]),
-        "eventId": build_categorical_vocab(train_df["eventId"]),
-    }
-
-    # Vocabulary sizes for categorical embedding layers
-    vocab_sizes = {
-        "processName": len(process_vocab),
-        "args": len(args_vocab),
-        "userId": len(cat_vocabs["userId"]),
-        "mountNamespace": len(cat_vocabs["mountNamespace"]),
-        "eventId": len(cat_vocabs["eventId"]),
-    }
-
-    # Preprocess — fit on train, transform val/test with train stats
-    train_feat, numeric_stats = preprocess_features(
-        train_df, process_vocab, args_vocab, cat_vocabs=cat_vocabs,
-    )
-    val_feat, _ = preprocess_features(
-        val_df, process_vocab, args_vocab, numeric_stats=numeric_stats, cat_vocabs=cat_vocabs,
-    )
-    test_feat, _ = preprocess_features(
-        test_df, process_vocab, args_vocab, numeric_stats=numeric_stats, cat_vocabs=cat_vocabs,
-    )
-
-    # Create datasets
-    train_ds = BethDataset(
-        train_feat, _get_labels(train_df),
-        window_size=window_size, stride=stride,
-    )
-    val_ds = BethDataset(
-        val_feat, _get_labels(val_df),
-        window_size=window_size, stride=stride,
-    )
-    test_ds = BethDataset(
-        test_feat, _get_labels(test_df),
-        window_size=window_size, stride=stride,
-    )
-
-    return train_ds, val_ds, test_ds, process_vocab, args_vocab, vocab_sizes
-
-
-# ── Per-Host Pipeline ──────────────────────────────────────────────────────────
 
 def _sort_within_hosts(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[int]]:
     """Sort each host's events by timestamp, concatenate in deterministic order.
 
-    Keeps each host's events contiguous so centered windows never span hosts.
+    Keeps each host's events contiguous so trailing windows never span hosts.
     Returns the sorted DataFrame and a list of event counts per host.
 
     Args:
@@ -887,53 +604,54 @@ def _sort_within_hosts(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[int]]:
     return df, [len(df)]
 
 
-def load_per_host_pipeline(
+# ── End-to-End Pipeline ────────────────────────────────────────────────────────
+
+def load_next_event_pipeline(
     raw_dir: str = "data/raw/per_host",
     window_size: int = 512,
-    stride: int = 32,
-    train_attack_frac: float = 0.2,
-    val_attack_frac: float = 0.2,
+    train_stride: int = 8,
+    val_stride: int = 16,
+    tune_stride: int = 1,
+    n_blocks: int = 50,
+    tune_frac: float = 0.2,
     seed: int = 42,
 ) -> Tuple[
-    "CenteredWindowDataset",
-    "CenteredWindowDataset",
-    "CenteredWindowDataset",
-    Optional["CenteredWindowDataset"],
+    TrailingWindowDataset,
+    TrailingWindowDataset,
+    TrailingWindowDataset,
+    TrailingWindowDataset,
     Dict[str, int],
-    Dict[str, int],
-    Dict[str, Dict[int, int]],
-    Dict[str, Tuple[float, float]],
-    Dict[str, int],
+    Dict[str, object],
 ]:
-    """End-to-end pipeline using per-host CSVs with centered-window datasets.
-
-    Loads CSVs from ``raw_dir``, splits by host, mixes attack data for supervised
-    training, and returns ``CenteredWindowDataset`` instances with per-event labels.
+    """End-to-end pipeline for next-event training and honest evaluation.
 
     The pipeline:
       1. Load per-host CSVs → sort within host → combine
-      2. Split by host (attack hosts → test, benign hosts → train/val)
-      3. Mix ``train_attack_frac`` of test data into training; hold out
-         ``val_attack_frac`` of the mixed portion as a mixed-class val set
-      4. Build vocabs + categorical vocabs from training data
-      5. Preprocess features; track host boundaries
-      6. Return ``CenteredWindowDataset`` instances + vocabulary artifacts
+      2. Split by host (attack hosts → test, benign hosts → train/val/test)
+      3. Carve the attack-val tuning set out of the test split
+      4. Build vocabularies from training data only
+      5. Preprocess features (categorical indices, deterministic buckets)
+      6. Return TrailingWindowDataset instances + vocabulary artifacts
+
+    Training and validation data are benign hosts only — no attack labels
+    anywhere in training (ADR-0003's core principle).
 
     Args:
-        raw_dir: Directory containing per-host BETH CSVs (``<hostname>.csv``).
-        window_size: Events per centered window (default 512).
-        stride: Stride between training centers (default 32).
-        train_attack_frac: Fraction of test-host events to mix into training
-            for supervised learning (default 0.2).
-        val_attack_frac: Fraction of the mixed-in attack data to hold out as
-            a mixed-class validation set (default 0.2 → 4 % of original test).
-        seed: Random seed for host split and attack-data splits.
+        raw_dir: Directory containing per-host BETH CSVs.
+        window_size: Events per trailing context (default 512).
+        train_stride: Target subsampling for training (default 8).
+        val_stride: Target subsampling for benign validation (default 16).
+        tune_stride: Target subsampling for the attack-val tuning set
+            (default 1 — dense, for threshold candidates).
+        n_blocks: Contiguous blocks per test host in the carve-out.
+        tune_frac: Probability each carved block lands in the tuning set.
+        seed: Random seed for host split and carve-out.
 
     Returns:
-        (train_ds, val_ds, test_ds, mixed_val_ds, process_vocab, args_vocab,
-         cat_vocabs, numeric_stats, vocab_sizes)
-        ``mixed_val_ds`` is ``None`` when ``train_attack_frac == 0`` or no evil
-        events exist in the test split.
+        (train_ds, val_ds, tune_ds, test_ds, vocab_sizes, vocabs)
+        Datasets carry ``.labels`` (evil per event) and ``.centers`` (scored
+        positions) for evaluation; ``vocabs`` maps
+        {'process_name', 'args', 'cat'} → vocabulary dicts.
     """
     # ── Load ────────────────────────────────────────────────────────────────
     host_dfs = load_beth_data(raw_dir)
@@ -942,115 +660,73 @@ def load_per_host_pipeline(
 
     # Sort within each host, then concatenate hosts deterministically
     sorted_parts = []
-    all_host_lengths = []
     for host in sorted(host_dfs):
         df = host_dfs[host]
         if "timestamp" in df.columns:
             df = df.sort_values("timestamp")
-        all_host_lengths.append(len(df))
         sorted_parts.append(df)
     full_df = pd.concat(sorted_parts, ignore_index=True)
 
-    # ── Split by host ───────────────────────────────────────────────────────
+    # ── Split by host, then carve attack-val out of test ─────────────────────
     train_df, val_df, test_df = split_by_host(full_df, seed=seed)
-
-    mixed_val_df = None
-
-    # ── Mix attack data for supervised training ──────────────────────────────
-    if train_attack_frac > 0 and "evil" in test_df.columns:
-        rng = np.random.default_rng(seed)
-        n_test = len(test_df)
-        n_mix = int(n_test * train_attack_frac)
-
-        indices = rng.permutation(n_test)
-        mix_idx = indices[:n_mix]
-        keep_idx = indices[n_mix:]
-
-        mix_pool = test_df.iloc[mix_idx].copy()
-        test_df = test_df.iloc[keep_idx].copy()
-
-        # Split mix_pool: (1 - val_attack_frac) → training, val_attack_frac → mixed val
-        if val_attack_frac > 0:
-            rng2 = np.random.default_rng(seed + 1)
-            n_pool = len(mix_pool)
-            n_train_mix = int(n_pool * (1.0 - val_attack_frac))
-            pool_indices = rng2.permutation(n_pool)
-            train_mix_idx = pool_indices[:n_train_mix]
-            mixed_val_idx = pool_indices[n_train_mix:]
-
-            train_mix = mix_pool.iloc[train_mix_idx].copy()
-            mixed_val_df = mix_pool.iloc[mixed_val_idx].copy()
-            train_df = pd.concat([train_df, train_mix], ignore_index=True)
-        else:
-            train_df = pd.concat([train_df, mix_pool], ignore_index=True)
+    tune_df, test_df = carve_attack_val(
+        test_df, n_blocks=n_blocks, tune_frac=tune_frac, seed=seed,
+    )
 
     # ── Sort within hosts (keep hosts contiguous) ────────────────────────────
     train_df, train_host_lengths = _sort_within_hosts(train_df)
     val_df, val_host_lengths = _sort_within_hosts(val_df)
+    tune_df, tune_host_lengths = _sort_within_hosts(tune_df)
     test_df, test_host_lengths = _sort_within_hosts(test_df)
 
-    if mixed_val_df is not None:
-        mixed_val_df, mixed_val_host_lengths = _sort_within_hosts(mixed_val_df)
-
     # ── Build vocabs from training data only ─────────────────────────────────
-    process_vocab = build_vocab(train_df["processName"], max_tokens=5000)
+    process_vocab = build_process_name_vocab(train_df["processName"])
     args_vocab = build_vocab(train_df["args"], max_tokens=10000)
+    cat_vocabs: Dict[str, Dict[int, int]] = {
+        "userId": build_categorical_vocab(train_df["userId"]),
+        "eventId": build_categorical_vocab(train_df["eventId"]),
+    }
 
-    cat_vocabs: Dict[str, Dict[int, int]] = {}
-    for col in ["userId", "mountNamespace", "eventId"]:
-        if col in train_df.columns:
-            cat_vocabs[col] = build_categorical_vocab(train_df[col])
-        else:
-            cat_vocabs[col] = {0: 0}  # default single-entry vocab for missing column
-
+    # +1 for the reserved OOV index on the value→index vocabs; the args
+    # token vocab already includes <PAD> and <UNK> in its length.
     vocab_sizes = {
-        "processName": len(process_vocab),
-        "args": len(args_vocab),
-        "userId": len(cat_vocabs["userId"]),
-        "mountNamespace": len(cat_vocabs["mountNamespace"]),
-        "eventId": len(cat_vocabs["eventId"]),
+        "process_name_vocab_size": len(process_vocab) + 1,
+        "args_vocab_size": len(args_vocab),
+        "user_id_vocab_size": len(cat_vocabs["userId"]) + 1,
+        "event_id_vocab_size": len(cat_vocabs["eventId"]) + 1,
+        "args_num_vocab_size": ARGS_NUM_CLASSES,
+        "return_value_vocab_size": RETURN_VALUE_CLASSES,
+        "parent_pid_vocab_size": 3,
+    }
+
+    vocabs = {
+        "process_name": process_vocab,
+        "args": args_vocab,
+        "cat": cat_vocabs,
     }
 
     # ── Preprocess ───────────────────────────────────────────────────────────
-    train_feat, numeric_stats = preprocess_features(
-        train_df, process_vocab, args_vocab, cat_vocabs=cat_vocabs,
-    )
-    val_feat, _ = preprocess_features(
-        val_df, process_vocab, args_vocab, numeric_stats=numeric_stats, cat_vocabs=cat_vocabs,
-    )
-    test_feat, _ = preprocess_features(
-        test_df, process_vocab, args_vocab, numeric_stats=numeric_stats, cat_vocabs=cat_vocabs,
-    )
-
-    mixed_val_feat = None
-    if mixed_val_df is not None:
-        mixed_val_feat, _ = preprocess_features(
-            mixed_val_df, process_vocab, args_vocab,
-            numeric_stats=numeric_stats, cat_vocabs=cat_vocabs,
-        )
+    train_feat = preprocess_features(train_df, process_vocab, args_vocab, cat_vocabs)
+    val_feat = preprocess_features(val_df, process_vocab, args_vocab, cat_vocabs)
+    tune_feat = preprocess_features(tune_df, process_vocab, args_vocab, cat_vocabs)
+    test_feat = preprocess_features(test_df, process_vocab, args_vocab, cat_vocabs)
 
     # ── Create datasets ──────────────────────────────────────────────────────
-    train_ds = CenteredWindowDataset(
-        train_feat, _get_labels(train_df), train_host_lengths,
-        window_size=window_size, stride=stride,
+    train_ds = TrailingWindowDataset(
+        train_feat, train_host_lengths, window_size, train_stride,
+        labels=_get_labels(train_df),
     )
-    val_ds = CenteredWindowDataset(
-        val_feat, _get_labels(val_df), val_host_lengths,
-        window_size=window_size, stride=stride,
+    val_ds = TrailingWindowDataset(
+        val_feat, val_host_lengths, window_size, val_stride,
+        labels=_get_labels(val_df),
     )
-    test_ds = CenteredWindowDataset(
-        test_feat, _get_labels(test_df), test_host_lengths,
-        window_size=window_size, stride=stride,
+    tune_ds = TrailingWindowDataset(
+        tune_feat, tune_host_lengths, window_size, tune_stride,
+        labels=_get_labels(tune_df),
+    )
+    test_ds = TrailingWindowDataset(
+        test_feat, test_host_lengths, window_size, 1,  # dense: evaluation
+        labels=_get_labels(test_df),
     )
 
-    mixed_val_ds = None
-    if mixed_val_feat is not None and mixed_val_df is not None:
-        mixed_val_ds = CenteredWindowDataset(
-            mixed_val_feat, _get_labels(mixed_val_df), mixed_val_host_lengths,
-            window_size=window_size, stride=stride,
-        )
-
-    return (
-        train_ds, val_ds, test_ds, mixed_val_ds,
-        process_vocab, args_vocab, cat_vocabs, numeric_stats, vocab_sizes,
-    )
+    return train_ds, val_ds, tune_ds, test_ds, vocab_sizes, vocabs

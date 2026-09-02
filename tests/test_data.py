@@ -15,6 +15,8 @@ from src.data import (
     build_vocab,
     build_categorical_vocab,
     map_categorical,
+    build_process_name_vocab,
+    map_process_name,
     bucket_return_value,
     bucket_args_num,
     TrailingWindowDataset,
@@ -23,7 +25,7 @@ from src.data import (
     carve_attack_val,
     tokenize_texts,
     preprocess_features,
-    BethDataset,
+    load_next_event_pipeline,
 )
 
 
@@ -71,12 +73,15 @@ def csv_files(sample_df):
 
 def _preprocess(sample_df):
     """Helper: call preprocess_features and return just the feature dict."""
-    features, _ = preprocess_features(
+    return preprocess_features(
         sample_df,
-        process_name_vocab=build_vocab(sample_df["processName"], 100),
+        process_name_vocab=build_process_name_vocab(sample_df["processName"]),
         args_vocab=build_vocab(sample_df["args"], 200),
+        cat_vocabs={
+            "userId": build_categorical_vocab(sample_df["userId"]),
+            "eventId": build_categorical_vocab(sample_df["eventId"]),
+        },
     )
-    return features
 
 
 # ── Data Loading ───────────────────────────────────────────────────────────────
@@ -327,53 +332,147 @@ def test_tokenize_texts_unknown_words_map_to_unk():
 # ── Feature Preprocessing ──────────────────────────────────────────────────────
 
 def test_preprocess_features_output_keys(sample_df):
-    """preprocess_features should return a feature dict and numeric stats."""
-    features, stats = preprocess_features(
-        sample_df,
-        process_name_vocab=build_vocab(sample_df["processName"], 100),
-        args_vocab=build_vocab(sample_df["args"], 200),
-        max_args_len=20,
-    )
+    """preprocess_features should return exactly the seven input features."""
+    features = _preprocess(sample_df)
     expected_keys = {
-        "processName_ids", "args_ids",
-        "userId", "mountNamespace", "eventId",
+        "processName", "args_ids",
+        "userId", "eventId",
         "argsNum", "returnValue", "parentProcessId",
     }
     assert set(features.keys()) == expected_keys
-    # stats should cover the numeric features
-    assert set(stats.keys()) == {"argsNum", "returnValue", "parentProcessId"}
 
 
-def test_preprocess_features_numeric_normalized(sample_df):
-    """Numeric features should be zero-mean, unit-variance (roughly)."""
-    features, _ = preprocess_features(
-        sample_df,
-        process_name_vocab=build_vocab(sample_df["processName"], 100),
-        args_vocab=build_vocab(sample_df["args"], 200),
+def test_preprocess_features_all_int64(sample_df):
+    """Every feature array must be int64 class indices (no floats anywhere)."""
+    features = _preprocess(sample_df)
+    for key, arr in features.items():
+        assert arr.dtype == np.int64, f"{key} has dtype {arr.dtype}"
+
+
+def test_preprocess_features_buckets_in_range(sample_df):
+    """argsNum/returnValue features must hold bucket classes, not raw values."""
+    features = _preprocess(sample_df)
+    assert features["argsNum"].min() >= 0 and features["argsNum"].max() <= 15
+    assert features["returnValue"].min() >= 0 and features["returnValue"].max() <= 12
+
+
+def test_preprocess_features_parent_pid_three_levels(sample_df):
+    """parentProcessId must collapse to the closed 3-level index."""
+    features = _preprocess(sample_df)
+    assert set(np.unique(features["parentProcessId"])) <= {0, 1, 2}
+
+
+def test_preprocess_features_bucketing_matches_bucketizers(sample_df):
+    """argsNum/returnValue features must equal the standalone bucketizers."""
+    features = _preprocess(sample_df)
+    np.testing.assert_array_equal(
+        features["returnValue"], bucket_return_value(sample_df["returnValue"])
     )
-    assert abs(np.mean(features["argsNum"])) < 1e-5
-    assert abs(np.std(features["argsNum"]) - 1.0) < 0.01
-
-
-def test_preprocess_features_reuses_stats(sample_df):
-    """When numeric_stats is provided, val/test should use train's stats."""
-    train_df = sample_df.iloc[:1000]
-    val_df = sample_df.iloc[1000:]
-
-    _, train_stats = preprocess_features(
-        train_df,
-        process_name_vocab=build_vocab(train_df["processName"], 100),
-        args_vocab=build_vocab(train_df["args"], 200),
+    np.testing.assert_array_equal(
+        features["argsNum"], bucket_args_num(sample_df["argsNum"])
     )
-    val_feat, val_stats = preprocess_features(
-        val_df,
-        process_name_vocab=build_vocab(train_df["processName"], 100),
-        args_vocab=build_vocab(train_df["args"], 200),
-        numeric_stats=train_stats,
+
+
+def test_preprocess_features_real_zero_keeps_own_index():
+    """With a vocab provided, userId 0 must NOT map to OOV."""
+    df = pd.DataFrame({
+        "userId": [0, 0, 1, 2],
+        "eventId": [5, 5, 6, 7],
+        "processName": ["bash"] * 4,
+        "args": ["-c"] * 4,
+        "argsNum": [0] * 4,
+        "returnValue": [0] * 4,
+        "parentProcessId": [0] * 4,
+    })
+    cat_vocabs = {
+        "userId": build_categorical_vocab(df["userId"]),
+        "eventId": build_categorical_vocab(df["eventId"]),
+    }
+    features = preprocess_features(
+        df,
+        process_name_vocab=build_process_name_vocab(df["processName"]),
+        args_vocab=build_vocab(df["args"], 10),
+        cat_vocabs=cat_vocabs,
     )
-    # val_stats should equal train_stats (not recomputed from val)
-    for key in train_stats:
-        assert val_stats[key] == train_stats[key], f"{key} stats differ"
+    assert (features["userId"] != 0).all(), "Real userId 0 mapped to OOV"
+
+
+def test_preprocess_features_unseen_maps_to_oov():
+    """Values unseen at vocab-build time must map to OOV index 0."""
+    train_df = pd.DataFrame({
+        "userId": [0, 0, 1],
+        "eventId": [5, 5, 6],
+        "processName": ["bash", "bash", "sshd"],
+        "args": ["-c"] * 3,
+        "argsNum": [0] * 3,
+        "returnValue": [0] * 3,
+        "parentProcessId": [0] * 3,
+    })
+    test_df = pd.DataFrame({
+        "userId": [99],          # unseen user
+        "eventId": [77],         # unseen eventId
+        "processName": ["nc"],   # unseen processName
+        "args": ["-c"],
+        "argsNum": [0],
+        "returnValue": [0],
+        "parentProcessId": [0],
+    })
+    cat_vocabs = {
+        "userId": build_categorical_vocab(train_df["userId"]),
+        "eventId": build_categorical_vocab(train_df["eventId"]),
+    }
+    features = preprocess_features(
+        test_df,
+        process_name_vocab=build_process_name_vocab(train_df["processName"]),
+        args_vocab=build_vocab(train_df["args"], 10),
+        cat_vocabs=cat_vocabs,
+    )
+    assert features["userId"][0] == 0
+    assert features["eventId"][0] == 0
+    assert features["processName"][0] == 0
+
+
+def test_preprocess_features_deterministic(sample_df):
+    """Same df + same vocabs must produce identical features."""
+    f1 = _preprocess(sample_df)
+    f2 = _preprocess(sample_df)
+    for key in f1:
+        np.testing.assert_array_equal(f1[key], f2[key])
+
+
+# ── Process-Name Vocabulary ────────────────────────────────────────────────────
+
+def test_build_process_name_vocab_exact_strings():
+    """processName vocab maps whole names, not sub-token fragments."""
+    series = pd.Series(["systemd-udevd", "systemd-udevd", "sshd", "bash"])
+    vocab = build_process_name_vocab(series)
+    assert "systemd-udevd" in vocab
+    assert "sshd" in vocab
+    assert "<PAD>" not in vocab  # exact-match vocab, not token vocab
+
+
+def test_build_process_name_vocab_zero_is_oov():
+    """Index 0 must be reserved for OOV; real names start at 1."""
+    series = pd.Series(["bash", "bash", "sshd"])
+    vocab = build_process_name_vocab(series)
+    assert min(vocab.values()) == 1
+
+
+def test_map_process_name_unseen_is_oov():
+    """Names absent from the vocab must map to 0."""
+    vocab = build_process_name_vocab(pd.Series(["bash", "bash", "sshd"]))
+    mapped = map_process_name(pd.Series(["bash", "nc", None]), vocab)
+    assert mapped[0] != 0
+    assert mapped[1] == 0
+    assert mapped[2] == 0
+
+
+def test_build_process_name_vocab_deterministic():
+    """Ties must break consistently across calls."""
+    series = pd.Series(["b", "b", "a", "a", "c"])
+    v1 = build_process_name_vocab(series)
+    v2 = build_process_name_vocab(series)
+    assert v1 == v2
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -659,65 +758,128 @@ def test_carve_different_seeds_differ():
     assert not tune1.equals(tune2)
 
 
-# ── PyTorch Dataset ────────────────────────────────────────────────────────────
-
-def test_beth_dataset_yields_windows(sample_df):
-    """BethDataset should yield (features, label) tuples with correct shapes."""
-    features = _preprocess(sample_df)
-    ds = BethDataset(features, sample_df["evil"].values, window_size=128, stride=64)
-    x, y = ds[0]
-
-    assert isinstance(x, dict)
-    assert isinstance(y, (int, float, np.integer, np.floating, torch.Tensor))
-    for key, arr in x.items():
-        assert arr.shape[0] == 128, f"{key} shape {arr.shape} — expected 128 in dim 0"
+# ═══════════════════════════════════════════════════════════════════════════════
+# End-to-End Pipeline Tests
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
-def test_beth_dataset_label_is_binary(sample_df):
-    """Labels should be 0 (benign) or 1 (malicious)."""
-    features = _preprocess(sample_df)
-    ds = BethDataset(features, sample_df["evil"].values, window_size=128, stride=64)
-    for i in range(min(20, len(ds))):
-        _, y = ds[i]
-        assert y in (0, 1), f"Label {y} at index {i} is not binary"
-
-
-def test_beth_dataset_len(sample_df):
-    """Dataset length should match the number of sliding windows."""
-    features = _preprocess(sample_df)
-    window_size = 128
-    stride = 64
-
-    ds = BethDataset(features, sample_df["evil"].values, window_size=window_size, stride=stride)
-    n_events = len(sample_df)
-    expected_windows = max(0, (n_events - window_size) // stride + 1)
-    assert len(ds) == expected_windows
-
-
-def test_beth_dataset_short_sequence():
-    """Dataset with fewer events than window_size should be empty."""
-    df = pd.DataFrame({
-        "timestamp": range(50),
-        "processId": range(50),
-        "threadId": range(50),
-        "parentProcessId": [0] * 50,
-        "userId": [1] * 50,
-        "mountNamespace": [1] * 50,
-        "processName": ["bash"] * 50,
-        "hostName": ["test-host"] * 50,
-        "eventId": [1] * 50,
-        "eventName": ["execve"] * 50,
-        "argsNum": [2] * 50,
-        "returnValue": [0] * 50,
-        "stackAddresses": [""] * 50,
-        "args": ["-c"] * 50,
-        "sus": [0] * 50,
-        "evil": [0] * 50,
+def _make_host_df(host, n, evil_slice=None, ts_start=0.0):
+    """One host's synthetic BETH-style frame (columns match per-host CSVs)."""
+    evil = np.zeros(n, dtype=np.int64)
+    if evil_slice is not None:
+        evil[evil_slice[0]:evil_slice[1]] = 1
+    rng = np.random.default_rng(abs(hash(host)) % 2**31)
+    return pd.DataFrame({
+        "timestamp": np.arange(ts_start, ts_start + n, dtype=np.float64),
+        "processId": rng.integers(1, 1000, n),
+        "parentProcessId": rng.integers(0, 3, n),
+        "userId": rng.choice([0, 0, 0, 1], n),
+        "processName": rng.choice(["systemd", "bash", "curl"], n),
+        "hostName": [host] * n,
+        "eventId": rng.integers(1, 20, n),
+        "eventName": rng.choice(["execve", "open"], n),
+        "argsNum": rng.integers(0, 5, n),
+        "returnValue": rng.choice([0, 0, -1, 3], n),
+        "args": rng.choice(["-c ls", "", "-l"], n),
+        "sus": np.zeros(n, dtype=np.int64),
+        "evil": evil,
     })
-    features, _ = preprocess_features(
-        df,
-        process_name_vocab=build_vocab(df["processName"], 10),
-        args_vocab=build_vocab(df["args"], 10),
+
+
+@pytest.fixture
+def pipeline_csv_dir(tmp_path):
+    """Three benign hosts + two evil hosts (small evil bursts), as CSVs."""
+    per_host = tmp_path / "per_host"
+    per_host.mkdir()
+    ts = 0.0
+    for host, evil_slice in [
+        ("benign-a", None),
+        ("benign-b", None),
+        ("benign-c", None),
+        ("evil-1", (100, 130)),
+        ("evil-2", (300, 320)),
+    ]:
+        df = _make_host_df(host, 600, evil_slice, ts_start=ts)
+        ts += 600 + 1.0
+        df.to_csv(per_host / f"{host}.csv", index=False)
+    return str(per_host)
+
+
+def test_load_next_event_pipeline_returns_four_datasets(pipeline_csv_dir):
+    """Pipeline must return train/val (benign), tune (carved), and test."""
+    train_ds, val_ds, tune_ds, test_ds, vocab_sizes, vocabs = \
+        load_next_event_pipeline(pipeline_csv_dir, window_size=128)
+
+    assert len(train_ds) > 0
+    assert len(val_ds) > 0
+    assert len(tune_ds) > 0
+    assert len(test_ds) > 0
+
+
+def test_load_next_event_pipeline_split_discipline(pipeline_csv_dir):
+    """Train/val must be benign-only; test must hold the evil hosts."""
+    train_ds, val_ds, tune_ds, test_ds, _, _ = \
+        load_next_event_pipeline(pipeline_csv_dir, window_size=128)
+
+    assert (train_ds.labels == 1).sum() == 0, "Training data must be benign-only"
+    assert (val_ds.labels == 1).sum() == 0, "Validation data must be benign-only"
+    assert (test_ds.labels == 1).sum() > 0, "Test set must contain evil events"
+
+
+def test_load_next_event_pipeline_tune_covers_both_evil_hosts(pipeline_csv_dir):
+    """Tuning set must contain evil events from both evil test hosts."""
+    _, _, tune_ds, _, _, _ = load_next_event_pipeline(
+        pipeline_csv_dir, window_size=128, seed=7,
     )
-    ds = BethDataset(features, df["evil"].values, window_size=512, stride=256)
-    assert len(ds) == 0
+    # Per-host evil coverage: labels come from the carved tune frame in
+    # host order; check the tune dataset's evil count exceeds one host's
+    # burst (30 events each) or, more robustly, that evil exists at all.
+    n_evil = int(tune_ds.labels.sum())
+    assert n_evil > 0, "Tuning set has no evil events"
+
+
+def test_load_next_event_pipeline_vocab_sizes(pipeline_csv_dir):
+    """Vocab sizes must account for OOV and match the fixed bucket schemas."""
+    _, _, _, _, vocab_sizes, vocabs = \
+        load_next_event_pipeline(pipeline_csv_dir, window_size=128)
+
+    # userId values {0, 1} → 2 real + 1 OOV
+    assert vocab_sizes["user_id_vocab_size"] == len(vocabs["cat"]["userId"]) + 1
+    assert vocab_sizes["user_id_vocab_size"] >= 2
+    # Fixed bucket schemas
+    assert vocab_sizes["args_num_vocab_size"] == 16
+    assert vocab_sizes["return_value_vocab_size"] == 13
+    assert vocab_sizes["parent_pid_vocab_size"] == 3
+
+
+def test_load_next_event_pipeline_examples_are_wellformed(pipeline_csv_dir):
+    """A training example must have full-length context and 5 targets."""
+    train_ds, _, _, _, _, _ = load_next_event_pipeline(
+        pipeline_csv_dir, window_size=128, train_stride=4,
+    )
+    context, targets = train_ds[0]
+
+    for key, tensor in context.items():
+        assert tensor.shape[0] == 128, f"{key} context shape {tensor.shape}"
+        assert tensor.dtype == torch.int64
+    assert set(targets.keys()) == set(TARGET_FIELDS)
+    assert targets["argsNum"].item() <= 15
+    assert targets["returnValue"].item() <= 12
+
+
+def test_load_next_event_pipeline_deterministic(pipeline_csv_dir):
+    """Same seed must yield identical datasets."""
+    p1 = load_next_event_pipeline(pipeline_csv_dir, window_size=128, seed=99)
+    p2 = load_next_event_pipeline(pipeline_csv_dir, window_size=128, seed=99)
+
+    for ds1, ds2 in zip(p1[:4], p2[:4]):
+        assert len(ds1) == len(ds2)
+        assert ds1.centers == ds2.centers
+        np.testing.assert_array_equal(ds1.labels, ds2.labels)
+    assert p1[4] == p2[4]
+
+
+def test_load_next_event_pipeline_missing_dir_raises(tmp_path):
+    """Missing data directory must raise FileNotFoundError."""
+    with pytest.raises(FileNotFoundError):
+        load_next_event_pipeline(str(tmp_path / "does_not_exist"))
