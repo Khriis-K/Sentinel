@@ -38,6 +38,12 @@ baselines:
   # iForest, Robust Covariance, One-Class SVM
   contamination: 0.01  # expected fraction of anomalies
 
+generation:
+  # Flag → group → rank pipeline (see issue #4)
+  gap: 3                  # max unflagged events between merged runs
+  context_padding: 10     # events before/after flagged run in LLM prompt
+  top_k_incidents: 100    # budget cap for DeepSeek API calls
+
 deepseek:
   api_key: "${DEEPSEEK_API_KEY}"  # resolved from env var
   model: "deepseek-chat"

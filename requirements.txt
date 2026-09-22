@@ -7,6 +7,7 @@ pandas>=2.0.0
 
 # Configuration & utilities
 PyYAML>=6.0
+python-dotenv>=1.0.0
 tqdm>=4.65.0
 
 # LLM API
